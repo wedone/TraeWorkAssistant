@@ -4,6 +4,74 @@
 
 ## 📋 快速开始
 
+### 方式一：裸机一键部署（Debian 12，推荐内网服务器）
+
+无需 Docker，也无需在部署机上装 Rust/Node——二进制与前端产物由 CI 构建并发布到 Release。
+脚本自包含，**不需要克隆仓库**，一行命令即可：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+```
+
+需要传参时用 `-s --` 把参数交给脚本（管道下直接跟参数会被 `bash` 当成自己的参数）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh \
+  | sudo bash -s -- -y
+```
+
+也可以先下载再执行，便于审查内容：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh
+sudo bash install.sh
+```
+
+若部署机无法访问 GitHub（raw 与 Release 都取不到），先在能出网的机器上下载安装包，再用 `--local`：
+
+```bash
+sudo bash install.sh --local ./aiwork-server-linux-amd64.tar.gz
+```
+
+脚本会依次完成：环境检查 → 下载 CI 产物（校验 sha256）→ 安装到 `/opt/aiwork` → 创建系统用户
+`aiwork` → 初始化 `/var/lib/aiwork` → 生成 `/etc/aiwork/aiwork.env`（含随机管理令牌与 vault 密钥）
+→ 写入 systemd 单元 → 启动并探活 → 打印访问地址与令牌。
+
+常用变体：
+
+```bash
+sudo bash install.sh -y                      # 全默认、零交互
+sudo bash install.sh --local ./pkg.tar.gz    # 离线部署（部署机不能出网）
+sudo bash install.sh --port 9090 --data-dir /srv/aiwork
+sudo bash install.sh --channel baremetal-docker_main   # 用 docker_main 分支构建
+```
+
+交互式会依次询问：安装目录、数据目录、运行用户、端口、时区、安装包来源（默认自动选择可用渠道）。
+管道方式（`curl | sudo bash`）同样能交互——脚本会从 `/dev/tty` 读取，不会被脚本内容干扰。
+
+重复执行即升级：数据目录与密钥原样保留，新版本启动或探活失败会自动完整回滚上一版
+（二进制 + dist + VERSION 一起还原）。探活同时校验 `/health` 与根路径，避免 dist 缺失时
+出现「部署成功但页面打不开」的假成功。
+
+`--channel` 不指定时脚本会自动探测：优先 `baremetal-latest`（main 分支构建），若尚未有该渠道
+则回落到最新的 `baremetal-<分支名>`，因此在还没合并到 main 时也能直接部署。
+
+> 用 `main` 分支的 raw 地址取脚本，但 CI 只产出 `baremetal-docker_main` 渠道时，
+> 脚本会自动回落到该渠道，无需改 URL。反之若想固定用某分支的脚本内容，
+> 把 URL 里的 `main` 换成对应分支名即可。
+
+**部署机要求**：Debian 12 / x86_64 / systemd。脚本只会补装 `curl`、`tar`、`tzdata`、
+`ca-certificates`（已存在则跳过），不安装 Docker、不安装编译工具链。
+
+**为什么不用 Docker 也能跑**：镜像里那层 Docker 特化只是环境变量
+（`AIWORK_DATA_DIR` / `AIWORK_WEB_DIST` / `AIWORK_LISTEN_ADDR` / `AIWORK_DISABLE_LOCAL_QUOTA`），
+脚本用 `EnvironmentFile=/etc/aiwork/aiwork.env` 注入等价取值，代码零改动。
+
+产物在 `debian:bookworm-slim` 里构建，glibc 版本与 Debian 12（2.36）一致；在更新发行版上编译再
+拷回 Debian 12 会因 glibc 过新而无法启动——这也是直接用 CI 产物而非本机编译的原因。
+
+### 方式二：Docker
+
 前置：Docker 20.10+ 与 Docker Compose v2。
 
 ```bash
@@ -140,6 +208,30 @@ tar czf aiwork-backup-$(date +%F).tgz data/
 ```
 
 > ⚠️ `vault_key.bin` 丢失 = 已存账号凭据永久不可解密（无找回手段）。跨机迁移要么携带该文件，要么两侧固定相同 `AIWORK_VAULT_KEY`。
+
+### 裸机部署（install.sh）的备份与升级
+
+裸机部署的数据目录默认 `/var/lib/aiwork`，密钥默认以 `AIWORK_VAULT_KEY` 形式写在
+`/etc/aiwork/aiwork.env`（权限 0600，仅 root 可读）。
+
+```bash
+# 备份（业务库 + 密钥文件一起打包；env 文件另存一份）
+systemctl stop aiwork-server
+tar czf ~/aiwork-$(date +%F).tgz -C /var/lib aiwork
+cp /etc/aiwork/aiwork.env ~/aiwork-env-$(date +%F).bak
+systemctl start aiwork-server
+
+# 升级：重新执行安装时用的同一条命令即可
+# （自动停服 → 换二进制与 dist → 重启 → 探活，失败完整回滚上一版）
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh \
+  | sudo bash -s -- -y
+```
+
+> ⚠️ 裸机部署的 vault 密钥在 `/etc/aiwork/aiwork.env` 里，**不在**数据目录内。
+> 只备份 `/var/lib/aiwork` 会丢掉密钥——必须连同 env 文件一起备份。
+> 脚本重跑时会沿用已有 env 中的密钥；若 env 丢失但 `conf/vault.stronghold` 仍在，
+> 脚本会在停服之前检测到这一状态并中止，避免静默生成新密钥把存量凭据变成不可解密。
+> 确认要放弃存量凭据才继续时，显式加 `--force-reset-vault`（`-y` 不会自动放行这条）。
 
 ## 🩺 常见问题
 

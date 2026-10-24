@@ -20,9 +20,23 @@
 
 ## 快速开始
 
-前置：Docker 20.10+ 与 Docker Compose v2。
+前置：Docker 20.10+ 与 Docker Compose v2（或用下方方式零：裸机部署，无需 Docker）。
 
-### 方式一：GHCR 镜像启动（推荐，免编译）
+### 方式零：裸机一键部署（Debian 12，无需 Docker / 无需编译）
+
+脚本自包含，不用克隆仓库，一行命令即可：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+```
+
+需要传参时用 `-s --`（管道下参数会被 `bash` 当成自己的）：`... | sudo bash -s -- -y`。
+
+脚本从 CI Release 下载现成二进制（校验 sha256），装到 `/opt/aiwork`，建系统用户与数据目录，
+生成 systemd 单元并启动探活（`/health` + 根路径双重校验），最后打印访问地址与管理令牌。
+重复执行即升级（数据与密钥保留，启动或探活失败完整回滚上一版）。详见 [server-deploy.md](docs/server-deploy.md)。
+
+### 方式一：GHCR 镜像启动（免编译）
 
 ```bash
 # 1. 拉取镜像（版本号随发布更新，也可用 latest / docker_main / sha-xxxxxxx）
