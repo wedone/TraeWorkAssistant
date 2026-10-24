@@ -1,0 +1,15 @@
+[package]
+name = "aiwork-bundle"
+version = "1.5.4"
+description = "AI Work 助手迁移包（.aiworkpack）加密信封与统一载荷"
+edition = "2021"
+rust-version = "1.89"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = "1"

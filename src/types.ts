@@ -103,6 +103,22 @@ export interface ImportReport {
   tags_ignored?: number;
 }
 
+/** 迁移包（.aiworkpack）导入结果：按应用聚合，单应用失败不阻断其它应用 */
+export interface BundleImportReport {
+  apps: Record<
+    string,
+    {
+      added?: number;
+      updated?: number;
+      skipped?: number;
+      with_credentials?: number;
+      groups_added?: number;
+      [key: string]: unknown;
+    }
+  >;
+  errors: Record<string, string>;
+}
+
 // ---- F-46 导入预览（按索引导入）----
 /** 导入预览条目；index 为文件中 accounts 数组下标 */
 export interface ImportPreviewAccount {

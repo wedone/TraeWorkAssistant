@@ -14,6 +14,7 @@ import type {
   ApiKeysFileView,
   BuddyAiAccountView,
   BuddyAiUsageOfficialAll,
+  BundleImportReport,
   CheckinOpts,
   CheckinTrendPoint,
   CreditDetail,
@@ -422,6 +423,9 @@ export const api = {
       invoke<ImportReport>('accounts_import', { content, only }),
     // F-46：导入前预览（解析账号/分组、标记已存在，不写盘）
     importPreview: (content: string) => invoke<ImportPreview>('accounts_import_preview', { content }),
+    // P1：一次性导入 Windows 采集器导出的加密迁移包（Trae/WorkBuddy/Qoder）
+    importBundle: (envelope: Record<string, unknown>, password: string) =>
+      invoke<BundleImportReport>('bundle_import', { envelope, password }),
     // 按需取完整 JWT（列表接口只回掩码值；弹窗/复制场景调用）
     getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
   },

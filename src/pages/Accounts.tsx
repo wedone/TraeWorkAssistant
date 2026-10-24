@@ -5,6 +5,7 @@ import {
   Globe,
   HelpCircle,
   Loader2,
+  PackageOpen,
   Pencil,
   Plus,
   RefreshCw,
@@ -35,6 +36,7 @@ import { TagChips } from './accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from './accounts/TagsModal';
 import { HelpModal } from './accounts/HelpModal';
 import { ImportPreviewModal } from './accounts/ImportPreviewModal';
+import { BundleImportModal } from './accounts/BundleImportModal';
 import { JwtStatusBadge } from './accounts/JwtStatusBadge';
 import { JwtViewModal } from './accounts/JwtViewModal';
 import { OAuthLoginModal } from './accounts/OAuthLoginModal';
@@ -89,6 +91,11 @@ export default function Accounts() {
   const [exportBusy, setExportBusy] = useState(false);
   // Web 版文件选择：隐藏 input 触发系统文件选择框
   const importInputRef = useRef<HTMLInputElement>(null);
+  // P1 迁移包导入：文件解析结果 + 文件名 + 导入中状态
+  const bundleInputRef = useRef<HTMLInputElement>(null);
+  const [bundleName, setBundleName] = useState('');
+  const [bundleJson, setBundleJson] = useState<Record<string, unknown> | null>(null);
+  const [bundleBusy, setBundleBusy] = useState(false);
   // 刷新防重入（审查 F3.1）：连点会对上游逐账号重复发积分查询（易频控）
   const [refreshBusy, setRefreshBusy] = useState(false);
   // 删除确认防连点（审查 F3.4）：1s withMinDelay 窗口内可二次触发（Buddy 版已修，Trae 版对齐）
@@ -246,6 +253,43 @@ export default function Accounts() {
     });
   };
 
+  // P1：选择迁移包文件 → 解析外层 JSON → 打开口令弹窗
+  const handleBundleFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      if (parsed?.kind !== 'aiwork-bundle') {
+        toast('error', '不是 AI Work 迁移包（缺少 aiwork-bundle 标记）');
+        return;
+      }
+      setBundleName(file.name);
+      setBundleJson(parsed);
+    } catch (err) {
+      toast('error', `读取迁移包失败：${String(err)}`);
+    }
+  };
+
+  const confirmBundleImport = async (password: string) => {
+    if (!bundleJson || bundleBusy) return;
+    setBundleBusy(true);
+    try {
+      const report = await api.accounts.importBundle(bundleJson, password);
+      const okApps = Object.keys(report.apps);
+      const failedApps = Object.keys(report.errors);
+      const okText = okApps.length ? `成功 ${okApps.join('、')}` : '无应用导入成功';
+      const failText = failedApps.length ? `；失败 ${failedApps.join('、')}` : '';
+      toast(failedApps.length ? 'warn' : 'success', `迁移包导入：${okText}${failText}`);
+      setBundleJson(null);
+      setBundleName('');
+      await refreshAccounts();
+      await refreshGroups();
+    } catch (err) {
+      toast('error', `迁移包导入失败：${String(err)}`);
+    } finally {
+      setBundleBusy(false);
+    }
+  };
+
   const confirmImport = async () => {
     if (!importPreviewData || importing) return;
     const only = [...importSelected];
@@ -312,6 +356,14 @@ export default function Accounts() {
               {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
             <button
+              onClick={() => bundleInputRef.current?.click()}
+              disabled={bundleBusy}
+              className={bundleBusy ? 'btn-outline cursor-not-allowed opacity-60' : 'btn-outline'}
+              title="导入 Windows 采集器导出的加密迁移包（Trae / WorkBuddy / Qoder）"
+            >
+              {bundleBusy ? <Loader2 size={15} className="animate-spin" /> : <PackageOpen size={15} />} 导入迁移包
+            </button>
+            <button
               onClick={() => {
                 setGroupOpen(true);
                 // 池来源徽标：共享分组三池成员并集按前缀统计（可选增强，失败静默）
@@ -342,6 +394,19 @@ export default function Accounts() {
           const f = e.target.files?.[0];
           e.target.value = '';
           if (f) void handleImportFile(f);
+        }}
+      />
+
+      {/* 隐藏文件选择框：迁移包导入 */}
+      <input
+        ref={bundleInputRef}
+        type="file"
+        accept=".aiworkpack,application/json"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = '';
+          if (f) void handleBundleFile(f);
         }}
       />
 
@@ -702,6 +767,17 @@ export default function Accounts() {
         onToggle={toggleImportItem}
         onSelectOnly={setImportSelected}
         onConfirm={() => void confirmImport()}
+      />
+      <BundleImportModal
+        open={!!bundleJson}
+        fileName={bundleName}
+        busy={bundleBusy}
+        onClose={() => {
+          if (bundleBusy) return;
+          setBundleJson(null);
+          setBundleName('');
+        }}
+        onConfirm={(password) => void confirmBundleImport(password)}
       />
     </div>
   );

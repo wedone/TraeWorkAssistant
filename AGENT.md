@@ -52,7 +52,9 @@ ai-work-assistant/
 │   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters；本地 token 源为桌面版专属，Web 版禁用）
 │   │                             #   buddy/*（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── crates/
+│   ├── aiwork-bundle/            # .aiworkpack 加密信封（Argon2id + AES-256-GCM）与统一载荷
 │   ├── aiwork-core/              # 业务核心：state/models/store/tasks/{trae_checkin,wb_checkin,wb_common,wb_credits,scheduler}/api_server/* + notify.rs（Bark/Server酱/webhook）
+│   ├── aiwork-collector/         # Windows 采集器：扫描本机 Trae/WB/Qoder 登录态，导出加密包（egui）
 │   └── aiwork-server/            # axum 单体：main.rs(启动序+--task-run) / admin(cmd_bridge 白名单命令桥 + sse + ws 双向推送 + ip_allow + admin_tokens + 鉴权) / static_files.rs
 └── scripts/                      # sync_version.mjs(版本单源同步) / gen_asset_base64.mjs(promo banner) / build_debian.sh(Debian 发布包)
 ```
@@ -65,7 +67,7 @@ ai-work-assistant/
 
 | 模块 | 命令（前缀/代表） | 说明 |
 |---|---|---|
-| 账号 | `accounts_list` / `account_add_manual` / `account_delete` / `account_update` / `account_get_jwt` / `accounts_export_raw` / `accounts_import` / `accounts_import_preview` | CRUD + 掩码下发（完整 JWT 按需取）+ 导入导出（导入前预览） |
+| 账号 | `accounts_list` / `account_add_manual` / `account_delete` / `account_update` / `account_get_jwt` / `accounts_export_raw` / `accounts_import` / `accounts_import_preview` / `bundle_import` | CRUD + 掩码下发（完整 JWT 按需取）+ 导入导出（导入前预览）+ 迁移包导入（Trae/WB/Qoder 一次解密分发） |
 | OAuth | `oauth_get_login_url` / `oauth_parse_callback` / `oauth_login` | Trae 粘贴回调模式：取登录链接 → 任意设备登录 → 复制回调 URL → 解析入池 |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` / `credits_daily_list` / `usage_history` | 查询 / 明细 / 批量刷新（快照任务共用）/ 每日快照列表 / Trae 官网消耗明细（按本地日聚合落盘，fresh=true 增量拉取） |

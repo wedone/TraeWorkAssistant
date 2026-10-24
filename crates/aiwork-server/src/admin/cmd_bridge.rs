@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use aiwork_core::commands::{
-    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, qoder,
-    shared_groups, tags, usage_history, wb_config, workbuddy,
+    accounts, api_server as api_server_cmd, bundle as bundle_cmd, checkin as checkin_cmd, misc,
+    oauth, qoder, shared_groups, tags, usage_history, wb_config, workbuddy,
 };
 use aiwork_core::state::AppState;
 use axum::extract::{Path, State};
@@ -118,6 +118,12 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "accounts_import_preview" => {
             let content = arg(&args, "content")?;
             accounts::accounts_import_preview(state, content).and_then(to_json)
+        }
+        // 迁移包导入（Windows 采集器导出的 .aiworkpack）：解密后分发到三池导入
+        "bundle_import" => {
+            let envelope: Value = arg(&args, "envelope")?;
+            let password: String = arg(&args, "password")?;
+            bundle_cmd::bundle_import(state, envelope, password)
         }
         "account_add_manual" => {
             let name_ = arg(&args, "name")?;

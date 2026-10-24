@@ -163,6 +163,22 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 
 > ⚠️ 桌面版 vault 快照（DPAPI 加密）**不可迁移**——凭据经导出文件以明文中转，导出后请及时删除该文件。
 
+## 🪟 Windows 采集器（.aiworkpack）
+
+用途：把 Windows 本机 Trae / WorkBuddy / Qoder 已登录账号打包，一次导入 Web 端。
+
+1. 获取 `aiwork-collector.exe`：仓库 Actions → `Build Windows Collector` → 下载 `aiwork-collector-windows-x64` 产物；
+2. 双击运行，勾选应用，点「扫描本机账号」；
+3. 设置导出路径与口令（至少 8 个字符），点「导出加密包」；
+4. Web 端 → 账号管理 →「导入迁移包」，选择 `.aiworkpack` 并输入同一口令。
+
+限制与安全：
+
+- **Trae** 本地只能导出 JWT（无 refresh_token），JWT 到期后需在 Web 端 OAuth 一次；
+- **WorkBuddy / Qoder** 含 refresh_token，服务端可长期续期；
+- 迁移包内含账号凭证，等同于密码；导入完成后请删除源文件；
+- 采集器只读本机登录态，不访问网络、不上传任何数据。
+
 ## 🛡️ 安全边界
 
 - **管理面** `/api/*`：主令牌 + 附加管理员令牌（可签发/吊销，最多 20 个）并集校验 → HttpOnly Cookie 会话（7 天有效期），未登录一律 401；

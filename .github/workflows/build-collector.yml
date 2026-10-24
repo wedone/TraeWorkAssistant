@@ -1,0 +1,40 @@
+# Windows 采集器构建（P1）
+#
+# 产物：aiwork-collector.exe（单文件，无 WebView2 / 无额外运行时）
+# 触发：push 到 debian_native、push tag v*、手动 workflow_dispatch
+name: Build Windows Collector
+
+on:
+  push:
+    branches: [debian_native]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-collector-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: 构建 aiwork-collector（Windows x64）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建采集器
+        run: cargo build --release -p aiwork-collector
+
+      - name: 上传采集器
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiwork-collector-windows-x64
+          path: target/release/aiwork-collector.exe
+          if-no-files-found: error
+          retention-days: 14

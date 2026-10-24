@@ -29,7 +29,7 @@ npm ci --no-audit --no-fund
 npm run build
 
 echo "==> 构建服务端（release）"
-cargo build --release --locked -p aiwork-server
+cargo build --release -p aiwork-server
 
 OUT_DIR="$ROOT/release"
 STAGE_NAME="aiwork-server_${VERSION}_linux_${ARCH}"
