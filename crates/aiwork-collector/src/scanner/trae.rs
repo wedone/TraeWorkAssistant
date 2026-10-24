@@ -45,7 +45,6 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
 
     let mut cookie_errors: Vec<String> = Vec::new();
     let mut locked = false;
-    let mut need_admin = false;
     for db in [
         // 主数据目录 Cookies：Trae CN 运行时通常被独占锁定，关闭 Trae 后可读
         dir.join("Network").join("Cookies"),
@@ -62,9 +61,6 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
         if let Err(e) = scan_cookies_db(&db, key.as_deref(), &mut map) {
             if e.contains("占用") || e.contains("os error 32") || e.contains("管理员") {
                 locked = true;
-            }
-            if e.contains("管理员") {
-                need_admin = true;
             }
             cookie_errors.push(format!("{}：{e}", db.display()));
         }
@@ -83,16 +79,11 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
     }
 
     if map.is_empty() {
-        if need_admin {
+        if locked {
             messages.push(
-                "Trae：Trae CN 正在运行并锁定 Cookies。请右键本程序选择「以管理员身份运行」\
-                 后重新扫描；或完全退出 Trae CN 后重试。"
-                    .into(),
-            );
-        } else if locked {
-            messages.push(
-                "Trae：Trae CN 正在运行并锁定了 Cookies 数据库，无法读取。\
-                 请完全退出 Trae CN（含托盘/后台进程）后重新扫描。"
+                "Trae：Trae CN 正在运行并锁定 Cookies，无法读取。\
+                 请完全退出 Trae CN 后重新扫描，或直接在 Web 端使用 Trae OAuth 登录\
+                 （推荐，可获取 refresh_token）。"
                     .into(),
             );
         } else if !cookie_errors.is_empty() {

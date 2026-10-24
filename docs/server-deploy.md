@@ -175,7 +175,7 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 限制与安全：
 
 - **Trae** 本地只能导出 JWT（无 refresh_token），JWT 到期后需在 Web 端 OAuth 一次；
-- **Trae CN 运行时会独占锁定 `Network\Cookies`**：采集器会提示「以管理员身份运行」——右键 exe 选择该项后，使用 Windows 备份语义读取锁定文件；也可以完全退出 Trae CN 后再扫描；
+- **Trae CN 运行时会独占锁定 `Network\Cookies`**：采集器提示无法读取时，请完全退出 Trae CN 后扫描；也可以直接使用 Web 端「OAuth 登录」（推荐，可获得 refresh_token）。以管理员身份运行仅在系统授予 `SeBackupPrivilege` 时有效；
 - **WorkBuddy / Qoder** 含 refresh_token，服务端可长期续期；
 - 迁移包内含账号凭证，等同于密码；导入完成后请删除源文件；
 - 采集器只读本机登录态，不访问网络、不上传任何数据。
