@@ -41,7 +41,7 @@ const KIND: &str = "aiwork-bundle";
 const VERSION: i64 = 1;
 
 /// 统一载荷：各应用段直接承载对应池的导出文档（保持既有导入函数兼容）。
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct BundlePayload {
     #[serde(default)]
     pub exported_at: String,
