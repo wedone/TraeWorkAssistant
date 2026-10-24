@@ -12,7 +12,7 @@ use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
+    CloseHandle, GetLastError, SetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
@@ -106,6 +106,9 @@ fn enable_backup_privilege() -> Result<(), String> {
                 Attributes: SE_PRIVILEGE_ENABLED,
             }],
         };
+        // 必须先清零 last-error：AdjustTokenPrivileges 成功时不会重置旧错误，
+        // 直接读取可能拿到之前残留的 ERROR_NOT_ALL_ASSIGNED（易误判为无权限）
+        SetLastError(0);
         let ok = AdjustTokenPrivileges(
             token,
             0,
