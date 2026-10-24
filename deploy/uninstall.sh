@@ -24,7 +24,9 @@ set -Eeuo pipefail
 ASSUME_YES=0
 KEEP_DATA=0
 
-c_info='\033[1;36m'; c_ok='\033[1;32m'; c_warn='\033[1;33m'; c_err='\033[1;31m'; c_off='\033[0m'
+# 用 $'...' 让变量里存真实 ESC 字符：printf 只解释格式串的转义，
+# 以 %s 传参时不会解析字面的 \033
+c_info=$'\033[1;36m'; c_ok=$'\033[1;32m'; c_warn=$'\033[1;33m'; c_err=$'\033[1;31m'; c_off=$'\033[0m'
 say()  { printf "${c_info}==>${c_off} %s\n" "$*"; }
 ok()   { printf "${c_ok}  ✓${c_off} %s\n" "$*"; }
 warn() { printf "${c_warn}  !${c_off} %s\n" "$*" >&2; }
@@ -133,10 +135,11 @@ step 2/4 "探测裸机 systemd 部署"
 if [[ -f /etc/systemd/system/aiwork-server.service ]]; then
   add_unique UNITS "aiwork-server"
 fi
-# 其他可能命名的单元
+# 其他可能命名的单元。统一去掉 .service 后缀存储，避免与上面的裸名重复、
+# 也避免删除时拼成 aiwork-server.service.service
 while IFS= read -r u; do
   [[ -z "$u" ]] && continue
-  add_unique UNITS "$u"
+  add_unique UNITS "${u%.service}"
 done < <(systemctl list-unit-files --no-legend --no-pager 2>/dev/null \
          | awk '{print $1}' | grep -Ei '^(aiwork|traeworkassistant).*\.service$' || true)
 
@@ -220,13 +223,10 @@ if [[ $NOTHING -eq 1 ]]; then
 fi
 
 if [[ $ASSUME_YES -ne 1 ]]; then
-  cat <<EOF
-
-${c_warn}当前为 dry-run，未做任何修改。${c_off}
-确认执行卸载请重跑并加 --yes：
-  sudo bash uninstall.sh --yes$( [[ $KEEP_DATA -eq 1 ]] && echo ' --keep-data' )
-
-EOF
+  # 用 printf 而非 heredoc：heredoc 不解释 \033 转义，颜色码会被原样打印
+  printf '\n%s当前为 dry-run，未做任何修改。%s\n' "$c_warn" "$c_off"
+  printf '确认执行卸载请重跑并加 --yes：\n'
+  printf '  sudo bash uninstall.sh --yes%s\n\n' "$( [[ $KEEP_DATA -eq 1 ]] && echo ' --keep-data' )"
   exit 0
 fi
 
@@ -241,13 +241,20 @@ step "执行" "开始卸载"
 # 1) systemd 服务
 for u in "${UNITS[@]:-}"; do
   [[ -z "$u" ]] && continue
-  if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
+  # 只要单元文件存在就尝试停止；服务未运行或不存在时 stop 会失败，用 || true 兜住
+  if [[ -f "/etc/systemd/system/$u.service" ]] \
+     || systemctl list-unit-files --no-legend --no-pager "$u.service" 2>/dev/null | grep -q "^$u.service"; then
     systemctl stop "$u" 2>/dev/null || true
     systemctl disable "$u" 2>/dev/null || true
     ok "已停止并禁用 $u"
   fi
-  rm -f "/etc/systemd/system/$u.service"
-  ok "已删除单元文件 $u.service"
+  if [[ -f "/etc/systemd/system/$u.service" ]]; then
+    if rm -f "/etc/systemd/system/$u.service"; then
+      ok "已删除单元文件 $u.service"
+    else
+      warn "删除单元文件 $u.service 失败（可能需要 root）"
+    fi
+  fi
 done
 if [[ ${#UNITS[@]} -gt 0 ]]; then
   systemctl daemon-reload
