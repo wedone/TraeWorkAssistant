@@ -63,6 +63,33 @@ sudo bash install.sh --channel baremetal-docker_main   # 用 docker_main 分支�
 **部署机要求**：Debian 12 / x86_64 / systemd。脚本只会补装 `curl`、`tar`、`tzdata`、
 `ca-certificates`（已存在则跳过），不安装 Docker、不安装编译工具链。
 
+### 卸载旧实例
+
+若机器上已有旧版（Docker 或裸机），用 `deploy/uninstall.sh` 清理。它默认只做 dry-run 探测，
+列出将被删除的内容，不做任何修改：
+
+```bash
+# 1. 先看会删什么（dry-run，安全）
+curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/uninstall.sh
+sudo bash uninstall.sh
+
+# 2. 确认无误后执行（连数据一起删）
+sudo bash uninstall.sh --yes
+
+# 3. 或保留数据（SQLite / vault 密钥 / conf / logs）
+sudo bash uninstall.sh --yes --keep-data
+```
+
+自动识别两种形态：Docker（容器 `aiwork-server`、镜像 `aiwork-server:*`、
+`ghcr.io/*/traeworkassistant`、含 `aiwork-server` 服务的 compose 项目及其绑定挂载目录）
+与裸机（`aiwork-server.service`、`/opt/aiwork`、`/var/lib/aiwork`、`/etc/aiwork`）。
+
+删除范围受白名单约束：只删上述标准路径，以及位于已识别 compose/程序目录之下的数据目录；
+其他位置的数据目录会跳过并提示。**源码仓库目录只列出不删**（避免误删未提交内容），
+需要时按脚本末尾给出的 `rm -rf` 命令手动处理。
+
+> ⚠️ 不加 `--keep-data` 会连同 vault 密钥一起删除，已存账号凭据永久不可解密。
+
 **为什么不用 Docker 也能跑**：镜像里那层 Docker 特化只是环境变量
 （`AIWORK_DATA_DIR` / `AIWORK_WEB_DIST` / `AIWORK_LISTEN_ADDR` / `AIWORK_DISABLE_LOCAL_QUOTA`），
 脚本用 `EnvironmentFile=/etc/aiwork/aiwork.env` 注入等价取值，代码零改动。
