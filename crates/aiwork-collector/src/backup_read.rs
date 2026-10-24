@@ -88,7 +88,8 @@ fn enable_backup_privilege() -> Result<(), String> {
             &mut token,
         );
         if ok == 0 {
-            return Err("需要以管理员身份运行才能读取被 Trae 锁定的 Cookies".into());
+            let err = GetLastError();
+            return Err(format!("OpenProcessToken 失败（错误 {err}）"));
         }
 
         let name: Vec<u16> = "SeBackupPrivilege\0".encode_utf16().collect();
@@ -119,8 +120,13 @@ fn enable_backup_privilege() -> Result<(), String> {
         );
         let last = GetLastError();
         CloseHandle(token);
-        if ok == 0 || last == ERROR_NOT_ALL_ASSIGNED {
-            return Err("需要以管理员身份运行才能读取被 Trae 锁定的 Cookies".into());
+        if ok == 0 {
+            return Err(format!("AdjustTokenPrivileges 失败（错误 {last}）"));
+        }
+        if last == ERROR_NOT_ALL_ASSIGNED {
+            return Err(format!(
+                "SeBackupPrivilege 未被授予（错误 {last}；请确认以管理员身份运行）"
+            ));
         }
         Ok(())
     }
