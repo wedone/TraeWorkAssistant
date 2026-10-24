@@ -1,11 +1,11 @@
 # AGENT.md — AI Work 助手 (ai-work-assistant) v1.5.4
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
-> **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
+> **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 或 Debian 原生（systemd）部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
 
 ## 1. 一句话
 
-浏览器直访的多账号签到 + 积分查看 + 资源调度 + OpenAI/Anthropic/Codex 兼容 API 网关一站式工作台（React 18 前端 + Rust axum 单体），支持 Trae 与 WorkBuddy 双账号体系，Docker 一键部署。**所有数据仅存服务端 `AIWORK_DATA_DIR`（Docker 内 `/app/data`），出网仅 Trae/腾讯上游（ureq 直连，不读系统代理）。**
+浏览器直访的多账号签到 + 积分查看 + 资源调度 + OpenAI/Anthropic/Codex 兼容 API 网关一站式工作台（React 18 前端 + Rust axum 单体），支持 Trae 与 WorkBuddy 双账号体系，Docker 或 Debian 原生（systemd）部署。**所有数据仅存服务端 `AIWORK_DATA_DIR`（Docker 内 `/app/data` / 原生 `/var/lib/aiwork`），出网仅 Trae/腾讯上游（ureq 直连，不读系统代理）。**
 
 ## 2. Quick Start
 
@@ -19,7 +19,8 @@ cargo run -p aiwork-server       # 监听 127.0.0.1:7864；AIWORK_LISTEN_ADDR �
 cargo test --workspace           # Rust 单测（core 304+ / server 12+）
 
 # 生产部署
-docker compose up -d --build     # 详见 docs/server-deploy.md
+docker compose up -d --build     # Docker；详见 docs/server-deploy.md
+bash scripts/build_debian.sh     # Debian 原生发布包；安装 sudo bash deploy/install.sh
 ```
 
 ## 3. 技术栈
@@ -28,7 +29,7 @@ docker compose up -d --build     # 详见 docs/server-deploy.md
 |---|---|
 | 后端 | Rust 1.89 MSRV（workspace：aiwork-core + aiwork-server，axum 0.7 / tokio / ureq / rusqlite bundled / iota_stronghold） |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react |
-| 部署 | Docker 多阶段构建（node:20 → rust:1.97-slim → debian:bookworm-slim）+ docker-compose |
+| 部署 | Docker 多阶段构建（node:20 → rust:1.97-slim → debian:bookworm-slim）+ docker-compose；Debian 12 原生单二进制 + systemd（`deploy/`） |
 | 辅助 | Node.js 18+（scripts/*.mjs，零 npm 依赖） |
 
 ## 4. 目录地图
@@ -38,7 +39,8 @@ ai-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── Cargo.toml                    # workspace（aiwork-core + aiwork-server）
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
-├── Dockerfile / docker-compose.yml / .dockerignore   # 部署
+├── Dockerfile / docker-compose.yml / .dockerignore   # Docker 部署
+├── deploy/                       # Debian 原生部署：systemd 单元 / env 示例 / install.sh
 ├── docs/                         # server-deploy.md（部署）/ user-manual（手册）/ tech-framework（架构）/ product-design（设计）/ backlog（待办）/ tmp（转型计划）
 ├── src/                          # 前端（复用桌面版页面骨架，lib/tauri.ts 单点适配 REST + WS/SSE 实时层）
 │   ├── App.tsx                   # 登录 gate（authed）+ Sidebar + 页面切换 + Toaster
@@ -52,7 +54,7 @@ ai-work-assistant/
 ├── crates/
 │   ├── aiwork-core/              # 业务核心：state/models/store/tasks/{trae_checkin,wb_checkin,wb_common,wb_credits,scheduler}/api_server/* + notify.rs（Bark/Server酱/webhook）
 │   └── aiwork-server/            # axum 单体：main.rs(启动序+--task-run) / admin(cmd_bridge 白名单命令桥 + sse + ws 双向推送 + ip_allow + admin_tokens + 鉴权) / static_files.rs
-└── scripts/                      # sync_version.mjs(版本单源同步) / gen_asset_base64.mjs(promo banner)
+└── scripts/                      # sync_version.mjs(版本单源同步) / gen_asset_base64.mjs(promo banner) / build_debian.sh(Debian 发布包)
 ```
 
 ## 5. 管理面命令桥契约（Web 版权威）

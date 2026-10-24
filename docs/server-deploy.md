@@ -2,9 +2,11 @@
 
 > 单进程 axum 服务（`aiwork-server`）：管理面 REST + OpenAI/Anthropic 兼容网关 + 7 项定时任务调度 + 三渠道通知推送（Bark/Server酱/Webhook，应用内配置）+ React 静态托管，浏览器任意设备直访。
 
-## 📋 快速开始
+## 📋 快速开始（Docker）
 
 前置：Docker 20.10+ 与 Docker Compose v2。
+
+> 不想用 Docker？见下文「Debian 原生部署（systemd）」，单二进制直接由 systemd 托管。
 
 ```bash
 # 1. 构建并启动（首次构建约 10-20 分钟，Rust 编译占大头）
@@ -25,15 +27,113 @@ docker compose exec aiwork-server cat /app/data/conf/admin_token
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080` | 监听地址；改端口时需同步 `AIWORK_PORT` 与 compose 端口映射 |
-| `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口 |
+| `AIWORK_LISTEN_ADDR` | Docker `0.0.0.0:8080` / 原生 `127.0.0.1:8080` | 监听地址；Docker 改端口时需同步 `AIWORK_PORT` 与 compose 端口映射 |
+| `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口；原生部署不需要 |
 | `AIWORK_ADMIN_TOKEN` | 空（自动生成） | 管理面令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token` |
 | `AIWORK_VAULT_KEY` | 空（自动生成） | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密 |
-| `AIWORK_DATA_DIR` | `/app/data` | 数据目录（容器内固定挂载 volume） |
-| `AIWORK_WEB_DIST` | `/app/dist` | 前端静态资源目录（镜像内置） |
+| `AIWORK_DATA_DIR` | Docker `/app/data` / 原生 `/var/lib/aiwork` | 数据目录 |
+| `AIWORK_WEB_DIST` | Docker `/app/dist` / 原生 `/opt/aiwork/dist` | 前端静态资源目录 |
+| `AIWORK_DISABLE_LOCAL_QUOTA` | 空 | 服务端无本机 WorkBuddy 客户端时设为 `1`，关闭本地端口探测兜底（Docker/原生均建议开启） |
 | `TZ` | `Asia/Shanghai` | 时区（影响签到/调度的时间判定） |
 
-## 💾 数据持久化（volume `./data:/app/data`）
+## 🐧 Debian 原生部署（systemd）
+
+适用：Debian 12 bookworm（glibc 2.36），不安装 Docker，单二进制由 systemd 托管。运行期不需要 Node.js、Python、数据库服务或 OpenSSL。
+
+### 1. 获取发布包
+
+二选一：
+
+- **GitHub Actions**：仓库 Actions → `Build Debian Native Package` → 下载 `aiwork-server-linux-amd64` 产物；
+- **本地构建**（需 Debian 12 + Node.js 20 + Rust 1.89+）：
+
+```bash
+bash scripts/build_debian.sh
+# 产物：release/aiwork-server_<版本>_linux_amd64.tar.gz
+```
+
+> 构建环境必须为 Debian 12 或 glibc 不高于 2.36；在 Ubuntu 24.04 等更高 glibc 环境构建的二进制无法在 Debian 12 运行。
+
+### 2. 安装
+
+```bash
+tar xzf aiwork-server_<版本>_linux_amd64.tar.gz
+cd aiwork-server_<版本>_linux_amd64
+sudo bash deploy/install.sh
+```
+
+安装脚本（幂等，可重复执行用于升级）：
+
+1. 创建系统用户 `aiwork`；
+2. 安装二进制与 `dist/` 到 `/opt/aiwork`；
+3. 创建数据目录 `/var/lib/aiwork`（0700，归属 `aiwork`）；
+4. 首次安装生成 `/etc/aiwork/aiwork.env`（0600，已存在则保留）；
+5. 安装并启动 `aiwork-server.service`。
+
+```bash
+systemctl status aiwork-server
+journalctl -u aiwork-server -f
+sudo cat /var/lib/aiwork/conf/admin_token
+```
+
+浏览器访问 `http://127.0.0.1:8080`（服务器本机），或经反向代理后的域名。
+
+> 默认只监听 `127.0.0.1:8080`。公网访问请通过 Caddy/Nginx 反代并启用 TLS（见下文反代章节）。
+
+### 3. 配置
+
+编辑 `/etc/aiwork/aiwork.env` 后执行 `sudo systemctl restart aiwork-server`。原生部署关键项：
+
+```bash
+AIWORK_DATA_DIR=/var/lib/aiwork
+AIWORK_WEB_DIST=/opt/aiwork/dist
+AIWORK_LISTEN_ADDR=127.0.0.1:8080
+AIWORK_DISABLE_LOCAL_QUOTA=1
+TZ=Asia/Shanghai
+```
+
+- `AIWORK_ADMIN_TOKEN` 留空 → 首启生成 `conf/admin_token`；
+- `AIWORK_VAULT_KEY` 留空 → 首启生成 `conf/vault_key.bin`；
+- `AIWORK_DISABLE_LOCAL_QUOTA=1` 必须保留，避免云端取数失败时串行探测本机端口；
+- 若修改 `AIWORK_DATA_DIR`，必须同步调整 systemd 单元的 `StateDirectory` 与 `ReadWritePaths`（默认 `/var/lib/aiwork`）。
+
+### 4. 升级
+
+```bash
+sudo systemctl stop aiwork-server
+sudo install -m 0755 aiwork-server /opt/aiwork/aiwork-server
+sudo rm -rf /opt/aiwork/dist
+sudo install -d -m 0755 /opt/aiwork/dist
+sudo cp -R dist/. /opt/aiwork/dist/
+sudo systemctl start aiwork-server
+```
+
+数据全部在 `/var/lib/aiwork`，升级不丢；SQLite 迁移幂等，首启自动执行。
+
+### 5. 备份与日志
+
+```bash
+# 备份（停机一致性最好）
+sudo tar czf aiwork-backup-$(date +%F).tgz -C /var/lib aiwork
+
+# 运行日志
+journalctl -u aiwork-server -f
+ls /var/lib/aiwork/logs
+```
+
+**必须备份**：SQLite 库、`/var/lib/aiwork/conf/vault_key.bin`、`/var/lib/aiwork/conf/admin_token`。`vault_key.bin` 丢失 = 全部账号凭据永久不可解密。
+
+### 6. 与 Docker 部署的差异
+
+| 项 | Docker | Debian 原生 |
+|---|---|---|
+| 进程 | 容器内 PID 1 | systemd 托管 |
+| 数据目录 | `./data:/app/data` | `/var/lib/aiwork` |
+| 环境变量 | compose / `.env` | `/etc/aiwork/aiwork.env` |
+| 升级 | `docker compose up -d --build` | 替换二进制与 dist 后重启 |
+| 监听 | 默认 `0.0.0.0:8080` | 默认 `127.0.0.1:8080` |
+
+## 💾 数据持久化（Docker volume `./data:/app/data`）
 
 | 子目录 | 内容 | 备份要点 |
 |---|---|---|

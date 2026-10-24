@@ -1,0 +1,39 @@
+[Unit]
+Description=AI Work Assistant 服务端（aiwork-server）
+Documentation=https://github.com/smart-open/TraeWorkAssistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiwork
+Group=aiwork
+WorkingDirectory=/opt/aiwork
+EnvironmentFile=/etc/aiwork/aiwork.env
+ExecStart=/opt/aiwork/aiwork-server
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+SyslogIdentifier=aiwork-server
+UMask=0077
+LimitNOFILE=65535
+
+# 数据目录：systemd 自动创建 /var/lib/aiwork 并归属 aiwork:aiwork
+StateDirectory=aiwork
+StateDirectoryMode=0700
+
+# 安全加固：运行期只允许写数据目录
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/aiwork
+
+[Install]
+WantedBy=multi-user.target

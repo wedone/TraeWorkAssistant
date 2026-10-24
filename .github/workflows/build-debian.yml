@@ -1,0 +1,64 @@
+# Debian 原生发布包构建（systemd 部署）
+#
+# 为什么在 debian:bookworm 容器内构建：
+#   Rust 二进制依赖构建环境的 glibc；在 ubuntu-latest（24.04，glibc 2.39）构建的
+#   产物无法在 Debian 12（glibc 2.36）运行。容器与目标系统同代可保证兼容。
+#
+# 触发：
+#   - push 到 debian_native（P0 验证）
+#   - push tag v*（发布）
+#   - workflow_dispatch（手动）
+#
+# 产物：aiwork-server_<版本>_linux_amd64.tar.gz + .sha256
+name: Build Debian Native Package
+
+on:
+  push:
+    branches: [debian_native]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-debian-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-amd64:
+    name: 构建 aiwork-server（Debian 12 / amd64）
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    steps:
+      # 容器基础镜像无 git/curl，先安装 checkout 与构建所需工具
+      - name: 安装构建依赖
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config xz-utils zstd
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 构建发布包
+        run: bash scripts/build_debian.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiwork-server-linux-amd64
+          path: |
+            release/*.tar.gz
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 14

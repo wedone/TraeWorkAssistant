@@ -68,7 +68,21 @@ docker compose exec aiwork-server cat /app/data/conf/admin_token
 
 宿主端口自定义：项目根目录建 `.env` 写入 `AIWORK_PORT=9090` 后重建容器。端口自定义、TLS 反向代理、IP 允许列表、备份与恢复等详见 **[docs/server-deploy.md](docs/server-deploy.md)**。
 
-> ⚠️ 数据持久化在 volume `./data:/app/data`，其中 `conf/vault_key.bin` 是账号凭据加密密钥——**丢失即全部凭据不可解密**，务必纳入备份。
+### 方式三：Debian 原生（systemd，免 Docker）
+
+```bash
+# 获取发布包：GitHub Actions「Build Debian Native Package」产物，或本地构建
+bash scripts/build_debian.sh
+
+tar xzf release/aiwork-server_<版本>_linux_amd64.tar.gz
+cd aiwork-server_<版本>_linux_amd64
+sudo bash deploy/install.sh
+sudo cat /var/lib/aiwork/conf/admin_token   # 管理令牌
+```
+
+安装脚本会创建 `aiwork` 系统用户、安装到 `/opt/aiwork`、生成 `/etc/aiwork/aiwork.env`，并以 `aiwork-server.service` 常驻。运行期不需要 Node.js、Python、数据库服务或 OpenSSL。完整说明见 [docs/server-deploy.md](docs/server-deploy.md)「Debian 原生部署（systemd）」。
+
+> ⚠️ Docker 部署的数据持久化在 volume `./data:/app/data`，其中 `conf/vault_key.bin` 是账号凭据加密密钥——**丢失即全部凭据不可解密**，务必纳入备份。Debian 原生部署对应路径为 `/var/lib/aiwork/conf/vault_key.bin`。
 
 ## 开发
 
@@ -79,7 +93,7 @@ cargo test --workspace       # Rust 单测
 npm run test                 # 前端单测
 ```
 
-前置：Node.js 18+、Rust 1.88+。
+前置：Node.js 18+、Rust 1.89+。
 
 ## 从桌面版迁移 / 老版本说明
 
@@ -89,7 +103,7 @@ npm run test                 # 前端单测
 
 ## 文档
 
-- [服务端部署指南](docs/server-deploy.md) — Docker 部署 / 环境变量 / TLS 反代 / 数据迁移 / 安全加固
+- [服务端部署指南](docs/server-deploy.md) — Docker / Debian 原生（systemd）部署 / 环境变量 / TLS 反代 / 数据迁移 / 安全加固
 - [用户手册](docs/user-manual.md) — 功能页面操作指南：账号 / 签到 / 积分 / 网关 / 调度 / 通知 / FAQ
 - [项目速查（AGENT.md）](AGENT.md) — 面向人与 AI 的秒接上下文手册：架构 / 契约 / 红线
 - [产品设计](docs/product-design.md) — 产品定位 / 功能清单 / 交互流程 / 非功能需求
