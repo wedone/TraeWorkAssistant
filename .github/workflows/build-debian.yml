@@ -50,6 +50,9 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: 迁移包单元测试
+        run: cargo test -p aiwork-bundle
+
       - name: 构建发布包
         run: bash scripts/build_debian.sh
 

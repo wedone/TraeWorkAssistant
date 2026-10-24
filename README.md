@@ -99,6 +99,7 @@ npm run test                 # 前端单测
 
 - **Web 版（本仓库 main 分支，v1.0.0+）**：桌面壳（Tauri/托盘/登录态切换/豆包/MITM 代理/设备标识重置/计划任务）已整体退役，改为服务器常驻 + 浏览器访问。
 - **桌面版数据迁移**：桌面版 → 账号管理 → 导出 JSON → Web 版 → 账号管理 → 导入（WorkBuddy 账号同理）；桌面版 vault 快照（DPAPI 加密）不可迁移，详见 [server-deploy.md](docs/server-deploy.md) 迁移章节。
+- **Windows 批量迁移（.aiworkpack）**：下载 Actions 产物 `aiwork-collector-windows-x64`，运行采集器扫描本机 Trae/WorkBuddy/Qoder 登录态，导出加密包后在 Web 端「导入迁移包」一次导入。Trae 本地仅含 JWT，到期后需 OAuth 一次。
 - **原「Trae Work 助手」产品（2.x）**：在 `trae_work_main` 分支维护，仅支持 Trae Work 单应用，仅必要修复。
 
 ## 文档
