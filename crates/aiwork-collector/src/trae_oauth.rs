@@ -21,9 +21,7 @@ const CALLBACK_PATH: &str = "/authorize";
 #[derive(Deserialize)]
 struct Envelope<T> {
     ok: bool,
-    #[serde(default)]
     data: Option<T>,
-    #[serde(default)]
     error: Option<String>,
 }
 
