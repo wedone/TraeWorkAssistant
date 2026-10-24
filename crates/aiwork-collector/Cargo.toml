@@ -33,10 +33,6 @@ uuid = { version = "1", features = ["v4"] }
 # 保证 Linux 上的 cargo test --workspace 不需要 X11/Wayland 依赖
 [target.'cfg(windows)'.dependencies]
 eframe = "0.29"
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
-] }
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

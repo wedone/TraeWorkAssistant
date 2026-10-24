@@ -163,22 +163,22 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 
 > ⚠️ 桌面版 vault 快照（DPAPI 加密）**不可迁移**——凭据经导出文件以明文中转，导出后请及时删除该文件。
 
-## 🪟 Windows 采集器（.aiworkpack）
+## 🪟 Windows 采集器（.aiworkpack + Trae OAuth）
 
-用途：把 Windows 本机 Trae / WorkBuddy / Qoder 已登录账号打包，一次导入 Web 端。
+用途：WorkBuddy / Qoder 本机登录态打包导入；Trae 由采集器驱动服务端 OAuth，直接入池。
 
 1. 获取 `aiwork-collector.exe`：仓库 Actions → `Build Windows Collector` → 下载 `aiwork-collector-windows-x64` 产物；
-2. 双击运行，勾选应用，点「扫描本机账号」；
-3. 设置导出路径与口令（至少 8 个字符），点「导出加密包」；
+2. 在采集器顶部填写服务器地址（如 `http://10.0.0.9:8383`）与管理令牌（服务器上 `sudo cat /var/lib/aiwork/conf/admin_token`），点「Trae OAuth 登录」；浏览器完成 Trae 登录后，账号由服务端交换 token 并直接写入账号池；
+3. WorkBuddy / Qoder：勾选应用 →「扫描本机账号」→ 设置导出路径与口令 →「导出加密包」；
 4. Web 端 → 账号管理 →「导入迁移包」，选择 `.aiworkpack` 并输入同一口令。
 
 限制与安全：
 
-- **Trae** 本地只能导出 JWT（无 refresh_token），JWT 到期后需在 Web 端 OAuth 一次；
-- **Trae CN 运行时会独占锁定 `Network\Cookies`**：采集器提示无法读取时，请完全退出 Trae CN 后扫描；也可以直接使用 Web 端「OAuth 登录」（推荐，可获得 refresh_token）。以管理员身份运行仅在系统授予 `SeBackupPrivilege` 时有效；
+- **Trae 账号不进入迁移包**：OAuth 登录直接写入服务端，可获取 refresh_token；重复执行可添加多个账号；
+- **Trae 新版登录态无法离线提取**：位于 `%APPDATA%\Trae CN\User\globalStorage\storage.json` 的 `iCubeAuthInfo`，为 `tc` 私有加密，采集器不再读取 Cookies；
 - **WorkBuddy / Qoder** 含 refresh_token，服务端可长期续期；
 - 迁移包内含账号凭证，等同于密码；导入完成后请删除源文件；
-- 采集器只读本机登录态，不访问网络、不上传任何数据。
+- 采集器只读取本机 WorkBuddy/Qoder 登录态；联网仅用于调用所填服务器的 OAuth 命令。
 
 ## 🛡️ 安全边界
 

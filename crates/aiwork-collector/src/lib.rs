@@ -3,8 +3,6 @@
 #[cfg(windows)]
 pub mod app;
 #[cfg(windows)]
-pub mod backup_read;
-#[cfg(windows)]
 pub mod dpapi;
 #[cfg(windows)]
 pub mod headless;
@@ -12,3 +10,5 @@ pub mod headless;
 pub mod jwt;
 #[cfg(windows)]
 pub mod scanner;
+#[cfg(windows)]
+pub mod trae_oauth;

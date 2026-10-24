@@ -54,7 +54,7 @@ ai-work-assistant/
 ├── crates/
 │   ├── aiwork-bundle/            # .aiworkpack 加密信封（Argon2id + AES-256-GCM）与统一载荷
 │   ├── aiwork-core/              # 业务核心：state/models/store/tasks/{trae_checkin,wb_checkin,wb_common,wb_credits,scheduler}/api_server/* + notify.rs（Bark/Server酱/webhook）
-│   ├── aiwork-collector/         # Windows 采集器：扫描本机 Trae/WB/Qoder 登录态，导出加密包（egui）
+│   ├── aiwork-collector/         # Windows 采集器：Trae OAuth 驱动 + WorkBuddy/Qoder 扫描导出（egui）
 │   └── aiwork-server/            # axum 单体：main.rs(启动序+--task-run) / admin(cmd_bridge 白名单命令桥 + sse + ws 双向推送 + ip_allow + admin_tokens + 鉴权) / static_files.rs
 └── scripts/                      # sync_version.mjs(版本单源同步) / gen_asset_base64.mjs(promo banner) / build_debian.sh(Debian 发布包)
 ```

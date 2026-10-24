@@ -1,7 +1,9 @@
 //! 本机登录态扫描：按应用分发到独立扫描器，单应用失败不影响其它应用。
+//!
+//! Trae 不在此扫描：新版 Trae 把登录态放在 `storage.json` 的 `iCubeAuthInfo`
+//! （`tc` 私有加密），离线无法解密；Trae 改由 OAuth 直接登录服务端。
 
 pub mod qoder;
-pub mod trae;
 pub mod workbuddy;
 
 use serde_json::Value;
@@ -9,21 +11,18 @@ use serde_json::Value;
 /// 用户勾选要扫描的应用
 #[derive(Default, Clone, Copy)]
 pub struct Selection {
-    pub trae: bool,
     pub workbuddy: bool,
     pub qoder: bool,
 }
 
 #[derive(Default, Clone, Copy)]
 pub struct Counts {
-    pub trae: usize,
     pub workbuddy: usize,
     pub qoder: usize,
 }
 
 #[derive(Default)]
 pub struct ScanOutcome {
-    pub trae: Option<Value>,
     pub workbuddy: Option<Value>,
     pub qoder: Option<Value>,
     pub counts: Counts,
@@ -33,7 +32,7 @@ pub struct ScanOutcome {
 
 impl ScanOutcome {
     pub fn has_any(&self) -> bool {
-        self.trae.is_some() || self.workbuddy.is_some() || self.qoder.is_some()
+        self.workbuddy.is_some() || self.qoder.is_some()
     }
 }
 
@@ -47,17 +46,6 @@ fn count_accounts(doc: &Option<Value>) -> usize {
 
 pub fn scan(sel: Selection) -> ScanOutcome {
     let mut out = ScanOutcome::default();
-
-    if sel.trae {
-        match trae::scan() {
-            Ok((doc, msgs)) => {
-                out.counts.trae = count_accounts(&doc);
-                out.trae = doc;
-                out.messages.extend(msgs);
-            }
-            Err(e) => out.messages.push(format!("Trae 扫描失败：{e}")),
-        }
-    }
 
     if sel.workbuddy {
         match workbuddy::scan() {
