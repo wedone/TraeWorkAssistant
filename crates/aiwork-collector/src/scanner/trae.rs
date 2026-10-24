@@ -45,6 +45,7 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
 
     let mut cookie_errors: Vec<String> = Vec::new();
     let mut locked = false;
+    let mut need_admin = false;
     for db in [
         // 主数据目录 Cookies：Trae CN 运行时通常被独占锁定，关闭 Trae 后可读
         dir.join("Network").join("Cookies"),
@@ -59,8 +60,11 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
             continue;
         }
         if let Err(e) = scan_cookies_db(&db, key.as_deref(), &mut map) {
-            if e.contains("占用") || e.contains("os error 32") {
+            if e.contains("占用") || e.contains("os error 32") || e.contains("管理员") {
                 locked = true;
+            }
+            if e.contains("管理员") {
+                need_admin = true;
             }
             cookie_errors.push(format!("{}：{e}", db.display()));
         }
@@ -79,7 +83,13 @@ pub fn scan() -> Result<(Option<Value>, Vec<String>), String> {
     }
 
     if map.is_empty() {
-        if locked {
+        if need_admin {
+            messages.push(
+                "Trae：Trae CN 正在运行并锁定 Cookies。请右键本程序选择「以管理员身份运行」\
+                 后重新扫描；或完全退出 Trae CN 后重试。"
+                    .into(),
+            );
+        } else if locked {
             messages.push(
                 "Trae：Trae CN 正在运行并锁定了 Cookies 数据库，无法读取。\
                  请完全退出 Trae CN（含托盘/后台进程）后重新扫描。"
@@ -191,13 +201,17 @@ fn scan_cookies_db(db: &Path, key: Option<&[u8]>, map: &mut JwtMap) -> Result<()
     let td = std::env::temp_dir().join(format!("aiwork_ck_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
     let _guard = TempDirGuard(td.clone());
-    std::fs::copy(db, td.join("Cookies")).map_err(|e| {
-        if e.raw_os_error() == Some(32) {
+    let bytes = crate::backup_read::read_file(db).map_err(|e| {
+        if e.contains("管理员") {
+            "Cookies 文件被 Trae 占用，需要以管理员身份运行才能读取".to_string()
+        } else if e.contains("os error 32") || e.contains("占用") {
             "Cookies 文件被 Trae 占用（os error 32）".to_string()
         } else {
-            format!("Cookies 复制失败: {e}")
+            format!("Cookies 读取失败: {e}")
         }
     })?;
+    std::fs::write(td.join("Cookies"), &bytes)
+        .map_err(|e| format!("临时 Cookies 写入失败: {e}"))?;
     for suffix in ["-wal", "-shm"] {
         let side = db.with_file_name(format!("Cookies{suffix}"));
         if side.exists() {

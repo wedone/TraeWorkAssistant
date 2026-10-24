@@ -29,12 +29,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: 构建采集器
-        run: cargo build --release -p aiwork-collector
+        run: cargo build --release -p aiwork-collector --bins
 
       - name: 上传采集器
         uses: actions/upload-artifact@v4
         with:
           name: aiwork-collector-windows-x64
-          path: target/release/aiwork-collector.exe
+          path: |
+            target/release/aiwork-collector.exe
+            target/release/aiwork-collector-cli.exe
           if-no-files-found: error
           retention-days: 14
