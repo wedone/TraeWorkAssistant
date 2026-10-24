@@ -27,7 +27,7 @@ docker compose exec aiwork-server cat /app/data/conf/admin_token
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AIWORK_LISTEN_ADDR` | Docker `0.0.0.0:8080` / 原生 `127.0.0.1:8080` | 监听地址；Docker 改端口时需同步 `AIWORK_PORT` 与 compose 端口映射 |
+| `AIWORK_LISTEN_ADDR` | Docker `0.0.0.0:8080` / 原生 `127.0.0.1:8383` | 监听地址；Docker 改端口时需同步 `AIWORK_PORT` 与 compose 端口映射 |
 | `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口；原生部署不需要 |
 | `AIWORK_ADMIN_TOKEN` | 空（自动生成） | 管理面令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token` |
 | `AIWORK_VAULT_KEY` | 空（自动生成） | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密 |
@@ -76,9 +76,9 @@ journalctl -u aiwork-server -f
 sudo cat /var/lib/aiwork/conf/admin_token
 ```
 
-浏览器访问 `http://127.0.0.1:8080`（服务器本机），或经反向代理后的域名。
+浏览器访问 `http://127.0.0.1:8383`（服务器本机），或经反向代理后的域名。
 
-> 默认只监听 `127.0.0.1:8080`。公网访问请通过 Caddy/Nginx 反代并启用 TLS（见下文反代章节）。
+> 默认只监听 `127.0.0.1:8383`。公网访问请通过 Caddy/Nginx 反代并启用 TLS（见下文反代章节）。
 
 ### 3. 配置
 
@@ -87,7 +87,7 @@ sudo cat /var/lib/aiwork/conf/admin_token
 ```bash
 AIWORK_DATA_DIR=/var/lib/aiwork
 AIWORK_WEB_DIST=/opt/aiwork/dist
-AIWORK_LISTEN_ADDR=127.0.0.1:8080
+AIWORK_LISTEN_ADDR=127.0.0.1:8383
 AIWORK_DISABLE_LOCAL_QUOTA=1
 TZ=Asia/Shanghai
 ```
@@ -131,7 +131,7 @@ ls /var/lib/aiwork/logs
 | 数据目录 | `./data:/app/data` | `/var/lib/aiwork` |
 | 环境变量 | compose / `.env` | `/etc/aiwork/aiwork.env` |
 | 升级 | `docker compose up -d --build` | 替换二进制与 dist 后重启 |
-| 监听 | 默认 `0.0.0.0:8080` | 默认 `127.0.0.1:8080` |
+| 监听 | 默认 `0.0.0.0:8080` | 默认 `127.0.0.1:8383` |
 
 ## 💾 数据持久化（Docker volume `./data:/app/data`）
 
@@ -175,6 +175,7 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 限制与安全：
 
 - **Trae** 本地只能导出 JWT（无 refresh_token），JWT 到期后需在 Web 端 OAuth 一次；
+- **扫描 Trae 前必须完全退出 Trae CN**（含托盘/后台进程）：客户端运行时会独占锁定 `Network\Cookies`，采集器无法读取；扫描完成后再重新打开即可；
 - **WorkBuddy / Qoder** 含 refresh_token，服务端可长期续期；
 - 迁移包内含账号凭证，等同于密码；导入完成后请删除源文件；
 - 采集器只读本机登录态，不访问网络、不上传任何数据。
@@ -191,12 +192,14 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 
 ### 🔒 TLS 反向代理示例
 
+> 以下反代目标按原生部署默认 `8383`；Docker 部署请改为 `8080`。
+
 Caddy（自动 HTTPS，最省事）：
 
 ```caddy
 # Caddyfile
 aiwork.example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8383
 }
 ```
 
@@ -209,7 +212,7 @@ server {
     # ssl_certificate / ssl_certificate_key 按需配置（或用 certbot 自动签）
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:8383;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         # WebSocket 必需：/api/ws 实时事件通道（缺升级头时前端自动回退 SSE，建议显式开启）
@@ -243,7 +246,7 @@ Caddy 用 `@blocked not remote_ip ...` + `respond @blocked 403` 等价实现；�
 - **回环豁免**：`127.0.0.1` / `::1` 始终放行，避免误配置锁死本机运维；`/health` 探活不受限；
 - 未启用或列表为空时不拦截；取不到来源 IP 时 fail-closed 拒绝（403）。
 
-反代层与应用层可叠加：反代层挡流量，应用层兜底直连 8080 的旁路访问。
+反代层与应用层可叠加：反代层挡流量，应用层兜底直连 8383 的旁路访问。
 
 ## 💾 备份与恢复
 
