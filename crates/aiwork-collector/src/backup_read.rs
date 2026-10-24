@@ -6,8 +6,9 @@
 //!
 //! 该能力需要管理员权限（UAC 提升）；普通权限会返回明确的“需要管理员”错误。
 
-use std::ffi::c_void;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
@@ -18,8 +19,8 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -69,30 +70,11 @@ fn read_backup(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
 
+    // 用 std::fs::File 接管句柄：File 析构自动 CloseHandle，避免手写 ReadFile 循环
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
     let mut out = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let mut read: u32 = 0;
-        let ok = unsafe {
-            ReadFile(
-                handle,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut read,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let err = unsafe { GetLastError() };
-            unsafe { CloseHandle(handle) };
-            return Err(format!("备份方式读取失败（错误 {err}）"));
-        }
-        if read == 0 {
-            break;
-        }
-        out.extend_from_slice(&buf[..read as usize]);
-    }
-    unsafe { CloseHandle(handle) };
+    file.read_to_end(&mut out)
+        .map_err(|e| format!("备份方式读取失败: {e}"))?;
     Ok(out)
 }
 
