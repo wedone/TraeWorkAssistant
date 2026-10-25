@@ -32,7 +32,7 @@ pub mod wb_sticky;
 pub mod wb_toolexec;
 pub mod wb_upstream;
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::sync::{Arc, Mutex};
 
 pub use api_logger::ApiLogger;
@@ -43,9 +43,104 @@ pub use pool::ApiPool;
 pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
 pub const EP_LLM_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-pub const IDE_VERSION: &str = "0.1.50";
-pub const IDE_VERSION_CODE: &str = "20260811";
+/// 旧 SOLO 线身份（灰度对照组，保持改动前的线上表现）
+pub const LEGACY_IDE_VERSION: &str = "0.1.50";
+pub const LEGACY_IDE_VERSION_CODE: &str = "20260811";
+/// 客户端版本 / 版本号：统一由 `trae_identity` 提供（T1/T3），
+/// 与本机 IDE manifest 和 OAuth 授权页保持一致，不再硬编码。
+/// 注意 IDE 线版本号是递增数字（如 344），SOLO 线才是日期格式。
+pub fn ide_version() -> &'static str {
+    crate::trae_identity::app_version()
+}
+pub fn ide_version_code() -> &'static str {
+    crate::trae_identity::version_code()
+}
+pub fn package_type() -> &'static str {
+    crate::trae_identity::package_type()
+}
 pub const FUNCTION: &str = "solo_work_lite";
+/// IDE 线真实 function 取值（模型目录同步的 agent_type 即 solo_agent，见 models_sync）
+pub const FUNCTION_IDE: &str = "solo_agent";
+
+/// T5 灰度百分比（0–100），由 api_pool.json.trae_function_gray 写入。
+/// 0 = 全部沿用现状，100 = 全部使用 IDE 取值，可随时回滚。
+static TRAE_FUNCTION_GRAY: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_trae_function_gray(v: u8) {
+    TRAE_FUNCTION_GRAY.store(v.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn trae_function_gray() -> u8 {
+    TRAE_FUNCTION_GRAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// T5：按 uid 哈希固定分流（FNV-1a），同一账号恒走同一 function 形态。
+/// 与按请求随机相比，避免同账号在两种取值间跳变导致模型侧表现不稳定。
+pub fn function_for_uid(uid: &str) -> &'static str {
+    let gray = trae_function_gray();
+    if gray == 0 {
+        return FUNCTION;
+    }
+    if gray >= 100 {
+        return FUNCTION_IDE;
+    }
+    if uid_bucket(uid) < gray as u32 {
+        FUNCTION_IDE
+    } else {
+        FUNCTION
+    }
+}
+
+/// uid → [0,100) 确定性桶号
+fn uid_bucket(uid: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in uid.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h % 100
+}
+
+/// T3 灰度百分比（0–100）：请求头版本身份按 uid 分流。
+/// 0 = 全部沿用旧 SOLO 线身份，100 = 全部 IDE 身份。
+static TRAE_IDE_GRAY: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_trae_ide_gray(v: u8) {
+    TRAE_IDE_GRAY.store(v.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn trae_ide_gray() -> u8 {
+    TRAE_IDE_GRAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 账号是否命中灰度桶（同一账号恒得同一结果）
+fn in_gray(uid: &str, gray: u8) -> bool {
+    if gray == 0 {
+        return false;
+    }
+    if gray >= 100 {
+        return true;
+    }
+    uid_bucket(uid) < gray as u32
+}
+
+/// T3：按 uid 取版本号（灰度外用旧 SOLO 线值，灰度内用 IDE 真实值）
+pub fn ide_version_for(uid: &str) -> &'static str {
+    if in_gray(uid, trae_ide_gray()) {
+        crate::trae_identity::app_version()
+    } else {
+        LEGACY_IDE_VERSION
+    }
+}
+
+/// T3：按 uid 取版本 code（IDE 线为递增数字，SOLO 线为日期格式）
+pub fn ide_version_code_for(uid: &str) -> &'static str {
+    if in_gray(uid, trae_ide_gray()) {
+        crate::trae_identity::version_code()
+    } else {
+        LEGACY_IDE_VERSION_CODE
+    }
+}
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 

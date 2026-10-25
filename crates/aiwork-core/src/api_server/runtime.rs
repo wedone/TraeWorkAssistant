@@ -253,6 +253,23 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     );
     wb_pool.set_strategy(wb_strategy);
 
+    // T3/T5：Trae 池灰度（按 uid 哈希分流，0 = 全部沿用现状）
+    super::set_trae_ide_gray(pool_file.trae_ide_gray);
+    super::set_trae_function_gray(pool_file.trae_function_gray);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-Trae 灰度: identity={}% function={}% \
+(0=旧身份 {}/{}, 100=IDE {}/{})",
+            pool_file.trae_ide_gray,
+            pool_file.trae_function_gray,
+            super::LEGACY_IDE_VERSION,
+            super::LEGACY_IDE_VERSION_CODE,
+            super::ide_version(),
+            super::ide_version_code(),
+        ),
+    );
+
     // Qoder 池启动概况（p3-3 + 池内策略）：qoder_strategy 空 = 跟随 Trae 池策略
     //（与 Buddy 池 resolve_wb 同语义）
     let qoder_strategy =
@@ -611,6 +628,9 @@ pub fn apply_pool_snapshot(
     let accounts = crate::vault::load_accounts(state);
     // 走迁移入口（防止直读落 serde default 后整表写回静默覆盖迁移值）
     let pool_file: ApiPoolFile = load_pool_file(&state.data_dir);
+    // T3/T5 灰度随配置刷新（同步池与启动路径共用，幂等）
+    crate::api_server::set_trae_ide_gray(pool_file.trae_ide_gray);
+    crate::api_server::set_trae_function_gray(pool_file.trae_function_gray);
     let groups_file: GroupsFile = store::docs::groups_load(&store::db(&state.data_dir));
     let cooldowns_file: AccountCooldownsFile =
         store::docs::account_cooldowns_load(&store::db(&state.data_dir));

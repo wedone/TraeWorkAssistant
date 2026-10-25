@@ -24,7 +24,7 @@ use super::wb_route;
 use super::wb_sticky::SessionKey;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             InflightGuard,
-            AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
+            AGENT_HOST, APP_ID, EP_LLM_CHAT, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
 /// 请求体上限（issue #21/#138）：axum `Bytes` 提取器受 DefaultBodyLimit 约束
@@ -3048,11 +3048,14 @@ fn upstream_header_digest(r: &ureq::Response, sent_trace: &str, sent_req_id: &st
 
 fn make_upstream_request(
     jwt: &str,
-    _uid: &str,
+    uid: &str,
     device_id: &str,
     machine_id: &str,
     body: &[u8],
 ) -> Result<(Box<dyn Read + Send>, String), (u16, String, Option<u64>)> {
+    // T3：版本身份按 uid 灰度分流（请求头与请求体必须同源，见 payload 同款调用）
+    let ide_ver = super::ide_version_for(uid);
+    let ide_ver_code = super::ide_version_code_for(uid);
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -3071,9 +3074,9 @@ fn make_upstream_request(
         .set("x-ide-token", jwt)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
-        .set("x-app-version-code", IDE_VERSION_CODE)
-        .set("x-ide-version", IDE_VERSION)
-        .set("x-ide-version-code", IDE_VERSION_CODE)
+        .set("x-app-version-code", ide_ver_code)
+        .set("x-ide-version", ide_ver)
+        .set("x-ide-version-code", ide_ver_code)
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
         .set("x-device-brand", "CREFG-XX")
@@ -3082,12 +3085,12 @@ fn make_upstream_request(
         .set("x-machine-id", machine_id)
         .set("x-os-version", "Windows 11 Home China")
         .set("request-traffic-type", "prod")
-        .set("package-type", "stable_cn")
+        .set("package-type", super::package_type())
         .set("x-lgw-req-sdk-type", "3")
-        .set("x-lscbd-aid", "787976")
+        .set("x-lscbd-aid", crate::trae_identity::app_id())
         .set("x-lscbd-platform", "windows")
-        .set("x-ss-dp", "787976")
-        .set("app-version", IDE_VERSION)
+        .set("x-ss-dp", crate::trae_identity::app_id())
+        .set("app-version", ide_ver)
         .set("x-custom-trace-id", &trace_id[..16])
         .set("x-flow-traceparent", &format!("04-{}-{}-01", &trace_id[3..35], uuid_like_id()))
         .set("x-tt-trace-id", &trace_id)
