@@ -293,8 +293,9 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         let jwt_raw = account.jwt.trim();
         let jwt_clean = jwt_raw.strip_prefix("Cloud-IDE-JWT ").unwrap_or(jwt_raw).trim();
         // T4：版本身份与推理请求同源（按账号 uid 灰度分流，避免同步/推理两套身份并存）
-        let ide_ver = super::ide_version_for(&account.uid);
-        let ide_ver_code = super::ide_version_code_for(&account.uid);
+        let uid = account.user_id.as_deref().unwrap_or("");
+        let ide_ver = super::ide_version_for(uid);
+        let ide_ver_code = super::ide_version_code_for(uid);
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
