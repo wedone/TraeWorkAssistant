@@ -30,9 +30,9 @@ const OAUTH_CLIENT_SECRET: &str = "-";
 /// 客户端应用 id（tech-framework §6.2：云 IDE API 附带 X-App-Id 头；旧登录 URL 曾用）
 const OAUTH_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 /// 真实 IDE 页面参数快照（抓包 2026-09-16）：授权页据此进入 native_ide 原生授权
-/// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）
-const OAUTH_PAGE_PLUGIN_VERSION: &str = "2.3.83560";
-const OAUTH_PAGE_APP_VERSION: &str = "3.3.100";
+/// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）。
+/// app_version / plugin_version 改由 `trae_identity` 提供（T2）：
+/// 本机安装 IDE 升级后自动跟随，避免登录页版本与推理请求版本再次分叉。
 const OAUTH_PAGE_PLATFORM_CODE: &str = "IDE_PC";
 /// 授权完成后的回跳地址：粘贴回调模式下浏览器跳到此本机地址「无法连接」页，
 /// 用户复制地址栏 URL 回 Web UI 提交完成登录（端口 17388 与桌面版一致）
@@ -434,7 +434,9 @@ fn select_login_device(state: &AppState) -> (String, String) {
 fn generate_and_persist_login_device(
     state: &AppState,
 ) -> Result<crate::icube_auth::DeviceCredential, String> {
-    let cred = crate::icube_auth::generate_synthetic_device_credential(OAUTH_PAGE_APP_VERSION)?;
+    let cred = crate::icube_auth::generate_synthetic_device_credential(
+        crate::trae_identity::app_version(),
+    )?;
     let json = serde_json::to_value(&cred)
         .map_err(|e| format!("合成设备身份序列化失败: {e}"))?;
     let key = format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX);
@@ -598,7 +600,7 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         &code_challenge={code_challenge}\
         &code_challenge_method=S256\
         &channel_name=common",
-        plugin_version = OAUTH_PAGE_PLUGIN_VERSION,
+        plugin_version = crate::trae_identity::build_version(),
         client_id = oauth_client().client_id,
         trace_id = trace_id,
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
@@ -606,7 +608,7 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         device_id = device_id,
         hostname = urlencoding::encode(&hostname),
         os_version = urlencoding::encode("Windows"),
-        app_version = OAUTH_PAGE_APP_VERSION,
+        app_version = crate::trae_identity::app_version(),
         code_challenge = code_challenge,
     );
 

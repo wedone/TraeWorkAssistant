@@ -548,6 +548,15 @@ pub struct ApiPoolFile {
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
+    /// Trae 池版本身份灰度百分比（T3，0–100）：0 = 全部沿用旧 SOLO 线身份，
+    /// 100 = 全部 IDE 线身份。按 uid 哈希固定分流，请求头与请求体同源。
+    #[serde(default)]
+    pub trae_ide_gray: u8,
+    /// Trae 池 function 灰度百分比（T5，0–100）：0 = 全部沿用 solo_work_lite，
+    /// 100 = 全部使用 IDE 线取值（solo_agent）。按 uid 哈希固定分流，
+    /// 同一账号恒走同一形态，便于对比成功率与 4001 比例后回滚。
+    #[serde(default)]
+    pub trae_function_gray: u8,
     /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
     #[serde(default)]
     pub wb_default_thinking: bool,
@@ -726,6 +735,8 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             group_ids: Vec::new(),
             wb_enabled: false,
+            trae_ide_gray: 0,
+            trae_function_gray: 0,
             wb_default_thinking: false,
             wb_tool_exec: false,
             wb_bg_downgrade: false,

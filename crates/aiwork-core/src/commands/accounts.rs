@@ -52,11 +52,21 @@ fn seeded_stream(seed: &str, salt: &str, nbytes: usize) -> Vec<u8> {
     out
 }
 
-/// 由 uid 派生设备三元组（算法对齐 auto_checkin.py `get_device_for` gen=2）
+/// 由 uid 派生设备三元组（算法对齐 auto_checkin.py `get_device_for` gen=2）。
+/// device_id 取 16 位、首位非 0：对齐真实客户端 did 形态（如 2367684947221706），
+/// 旧 15 位派生与真实客户端位数不符（T6）。
 pub fn derive_device(uid: &str) -> DeviceEntry {
-    let device_id: String = seeded_stream(uid, "devid", 15)
+    let device_id: String = seeded_stream(uid, "devid", 16)
         .iter()
-        .map(|b| char::from(b'0' + b % 10))
+        .enumerate()
+        // 首位取 1..=9，其余 0..=9：真实 did 不以 0 开头
+        .map(|(i, b)| {
+            if i == 0 {
+                char::from(b'1' + b % 9)
+            } else {
+                char::from(b'0' + b % 10)
+            }
+        })
         .collect();
     let session_id: String = seeded_stream(uid, "sess", 32)
         .iter()

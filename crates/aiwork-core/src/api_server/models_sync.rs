@@ -292,6 +292,9 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         // 时的 strip_prefix 行为。
         let jwt_raw = account.jwt.trim();
         let jwt_clean = jwt_raw.strip_prefix("Cloud-IDE-JWT ").unwrap_or(jwt_raw).trim();
+        // T4：版本身份与推理请求同源（按账号 uid 灰度分流，避免同步/推理两套身份并存）
+        let ide_ver = super::ide_version_for(&account.uid);
+        let ide_ver_code = super::ide_version_code_for(&account.uid);
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
@@ -299,24 +302,24 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("User-Agent", "TraeClient/TTNet")
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", "default")
-            .set("x-app-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-app-version-code", ide_ver_code)
             .set("x-bridge-transport", "aha")
             .set("x-device-brand", "CREFG-XX")
             .set("x-device-cpu", "Intel")
             .set("x-device-id", device_id)
             .set("x-device-type", "windows")
             .set("x-ide-token", jwt_clean)
-            .set("x-ide-version", &super::IDE_VERSION)
-            .set("x-ide-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-ide-version", ide_ver)
+            .set("x-ide-version-code", ide_ver_code)
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
             .set("x-os-version", "Windows 11 Home China")
-            .set("package-type", "stable_cn")
-            .set("x-lscbd-aid", "787976")
+            .set("package-type", super::package_type())
+            .set("x-lscbd-aid", crate::trae_identity::app_id())
             .set("x-lscbd-platform", "windows")
-            .set("app-version", &super::IDE_VERSION)
-            .set("x-ss-dp", "787976")
+            .set("app-version", ide_ver)
+            .set("x-ss-dp", crate::trae_identity::app_id())
             .send_json(body.clone());
 
         match resp {

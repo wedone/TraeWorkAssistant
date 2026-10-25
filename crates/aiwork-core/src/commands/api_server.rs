@@ -97,6 +97,9 @@ fn merge_pool_set(
         group_ids: group_ids.unwrap_or_else(|| existing.group_ids.clone()),
         wb_group_ids: wb_group_ids.unwrap_or_else(|| existing.wb_group_ids.clone()),
         wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
+        // T3/T5 灰度沿用存量值（无 UI 配置项，直接改 api_pool.json 生效）
+        trae_ide_gray: existing.trae_ide_gray,
+        trae_function_gray: existing.trae_function_gray,
         wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
         wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
         wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
@@ -1002,6 +1005,8 @@ mod pool_merge_tests {
             qoder_strategy: "random".into(),
             group_ids: vec!["g1".into()],
             wb_enabled: true,
+            trae_ide_gray: 30,
+            trae_function_gray: 50,
             wb_default_thinking: true,
             wb_tool_exec: false,
             wb_bg_downgrade: false,

@@ -232,8 +232,13 @@ pub fn prepare_llm_chat_body(
     obj_mut.insert("model_name".into(), json!(model_name));
     obj_mut.insert("stream".into(), json!(true));
     // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function：
-    // 同步落库的来源视图优先（官方新上架免改代码），表内无视图时回退硬编码
-    let function = super::models_sync::function_for_model_in(models, &model.to_lowercase());
+    // 同步落库的来源视图优先（官方新上架免改代码），表内无视图时回退硬编码。
+    // T5 灰度：命中灰度桶的账号强制改用 IDE 线取值，其余沿用查表结果。
+    let function: String = if super::function_for_uid(uid) == super::FUNCTION_IDE {
+        super::FUNCTION_IDE.to_string()
+    } else {
+        super::models_sync::function_for_model_in(models, &model.to_lowercase())
+    };
     obj_mut.insert("function".into(), json!(function));
     // max_tokens：尊重客户端显式值（含 Anthropic max_tokens 透传，P2 修复），
     // 缺省兜底 4096（上游必需字段）
@@ -261,10 +266,11 @@ pub fn prepare_llm_chat_body(
     // 1M 窗口由上游内部决策，网关侧固定 168000 即可
     obj_mut.insert("prompt_max_tokens".into(), json!(168_000));
     obj_mut.insert("mode".into(), json!("FunctionCall"));
-    obj_mut.insert("ide_version".into(), json!(super::IDE_VERSION));
-    obj_mut.insert("ide_version_code".into(), json!(super::IDE_VERSION_CODE));
+    // T3：请求体版本身份与请求头同源（同一 uid 灰度结果一致）
+    obj_mut.insert("ide_version".into(), json!(super::ide_version_for(uid)));
+    obj_mut.insert("ide_version_code".into(), json!(super::ide_version_code_for(uid)));
     obj_mut.insert("app_id".into(), json!(super::APP_ID));
-    obj_mut.insert("package_type".into(), json!("stable_cn"));
+    obj_mut.insert("package_type".into(), json!(super::package_type()));
 
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
 }

@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod state;
 pub mod store;
 pub mod tasks;
+pub mod trae_identity;
 pub mod vault;
 
 pub mod api_server;
