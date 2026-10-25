@@ -53,20 +53,14 @@ fn seeded_stream(seed: &str, salt: &str, nbytes: usize) -> Vec<u8> {
 }
 
 /// 由 uid 派生设备三元组（算法对齐 auto_checkin.py `get_device_for` gen=2）。
-/// device_id 取 16 位、首位非 0：对齐真实客户端 did 形态（如 2367684947221706），
-/// 旧 15 位派生与真实客户端位数不符（T6）。
+/// 注意：device_id 必须是 15 位。真实客户端 did 虽是 16 位，但本函数为**派生值**，
+/// 须与 Python 签到端逐位一致（`test_derive_device_matches_python` 锁定实测值），
+/// 否则同一账号在签到与推理两条链路上呈现两个设备指纹，新 JWT 会被服务端 401。
+/// 真实客户端的 16 位 did 只应经 device_map.json 显式登记，不能在这里派生。
 pub fn derive_device(uid: &str) -> DeviceEntry {
-    let device_id: String = seeded_stream(uid, "devid", 16)
+    let device_id: String = seeded_stream(uid, "devid", 15)
         .iter()
-        .enumerate()
-        // 首位取 1..=9，其余 0..=9：真实 did 不以 0 开头
-        .map(|(i, b)| {
-            if i == 0 {
-                char::from(b'1' + b % 9)
-            } else {
-                char::from(b'0' + b % 10)
-            }
-        })
+        .map(|b| char::from(b'0' + b % 10))
         .collect();
     let session_id: String = seeded_stream(uid, "sess", 32)
         .iter()
