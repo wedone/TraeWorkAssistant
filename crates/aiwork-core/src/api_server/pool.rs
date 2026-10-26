@@ -369,18 +369,20 @@ impl ApiPool {
                 let refresh_invalid = a.refresh_token_invalid;
                 let disabled = cd.error_type == "SessionDead" || refresh_invalid;
                 // 聊天设备身份策略：
-                // - machine_id 始终按 uid 确定性派生（seeded_hex(64, uid, "mach")），跨机器一致，
-                //   天然满足"一账号一设备指纹"，不与 OAuth 登录层的机器级共享身份（icube 凭证）混用。
-                // - device_id 优先取 device_map 中用户显式登记的设备；缺条目时回落 derive_device(uid)
-                //   按 uid 派生（与签到伪设备同一派生体系）。绝不发送空 device_id：
+                // - device_id 优先取 device_map 中登录回写/显式登记的设备；缺条目时回落
+                //   derive_device(uid) 按 uid 派生（与签到伪设备同一派生体系）。绝不发送空 device_id：
                 //   "x-device-id: ''" 是显性指纹异常，容易在上游形成聚集特征触发影子风控。
-                let (device_id, machine_id) = match device_map.get(uid) {
-                    Some(d) => (d.device_id.clone(), seeded_hex(64, uid, "mach")),
-                    None => (
-                        crate::commands::accounts::derive_device(uid).device_id,
-                        seeded_hex(64, uid, "mach"),
-                    ),
-                };
+                // - machine_id 优先取 device_map 中与 device_id 同源落库的值（OAuth 登录时写入的
+                //   真实/合成凭证 machineId）；缺省时按 uid 派生兜底。登录与调用必须同一 machine_id。
+                let entry = device_map.get(uid);
+                let device_id = entry
+                    .map(|d| d.device_id.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| crate::commands::accounts::derive_device(uid).device_id);
+                let machine_id = entry
+                    .and_then(|d| d.machine_id.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| seeded_hex(64, uid, "mach"));
                 let jwt_raw = a.jwt.clone();
                 let jwt_clean = jwt_raw
                     .strip_prefix("Cloud-IDE-JWT ")

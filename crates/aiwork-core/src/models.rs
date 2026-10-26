@@ -124,6 +124,10 @@ pub struct DeviceEntry {
     pub market_user_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 设备机器码（真实客户端 telemetry.machineId，64 hex）：登录/刷新时随设备一起
+    /// 落库，推理与模型同步取同一值，避免同一账号在登录与调用阶段自报不同 machine_id
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
 
 pub type DeviceMap = HashMap<String, DeviceEntry>;

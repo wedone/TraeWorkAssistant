@@ -247,11 +247,17 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         .take(3)
         .filter_map(|a| {
             let uid = a.user_id.as_deref()?.to_string();
-            let device_id = device_map
-                .get(&uid)
+            let entry = device_map.get(&uid);
+            // 绝不发送空 x-device-id：无 device_map 条目时回落派生设备（与推理侧同源）
+            let device_id = entry
                 .map(|d| d.device_id.clone())
-                .unwrap_or_default();
-            let machine_id = super::pool::seeded_hex(64, &uid, "mach");
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| crate::commands::accounts::derive_device(&uid).device_id);
+            // machine_id 与登录/推理同源：优先 device_map 回写值，缺省按 uid 派生兜底
+            let machine_id = entry
+                .and_then(|d| d.machine_id.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| super::pool::seeded_hex(64, &uid, "mach"));
             Some((a, device_id, machine_id))
         })
         .collect();

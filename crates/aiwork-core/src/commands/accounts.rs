@@ -77,6 +77,7 @@ pub fn derive_device(uid: &str) -> DeviceEntry {
         device_id,
         market_user_id: Some(market_user_id),
         session_id: Some(session_id),
+        machine_id: None,
     }
 }
 

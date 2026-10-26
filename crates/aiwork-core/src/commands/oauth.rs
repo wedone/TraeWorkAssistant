@@ -9,12 +9,14 @@ use crate::state::AppState;
 /// 最近签发的 OAuth 登录会话（CSRF 防护 + PKCE）：oauth_get_login_url 签发时记录，
 /// oauth_parse_callback 用 loginTraceID 双向绑定校验（抓包实证：login_trace_id 参数
 /// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换。
-/// device_id：本会话选定的凭证设备（issue #76 轮转 / Web-only 每登录会话合成身份）——
-/// 登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
+/// device_id / machine_id：本会话选定的凭证设备（issue #76 轮转 / Web-only 每登录
+/// 会话合成身份）——登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者
+/// 共用同一套，保证登录与调用阶段指纹同源
 struct PendingLogin {
     state: String,
     pkce_verifier: String,
     device_id: String,
+    machine_id: String,
 }
 static LAST_OAUTH_STATE: Mutex<Option<PendingLogin>> = Mutex::new(None);
 
@@ -131,6 +133,10 @@ pub struct OAuthCallbackInfo {
     /// 交换与 device_map 回写，保证整条登录链路设备同源
     #[serde(default)]
     pub device_id: Option<String>,
+    /// 与 device_id 同源的机器码：回写 device_map 后推理/模型同步复用同一值。
+    /// 仅服务端内部使用，不随命令结果回传前端
+    #[serde(default, skip_serializing)]
+    pub machine_id: Option<String>,
 }
 
 /// OAuth 登录 URL 响应
@@ -300,7 +306,8 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
             }
         }
         if dev.machine_id.is_empty() {
-            dev.machine_id = random_hex(32);
+            // 对齐真实 telemetry.machineId 形态（64 hex）
+            dev.machine_id = random_hex(64);
         }
         if dev.device_id.is_empty() {
             dev.device_id = (0..15)
@@ -521,7 +528,7 @@ pub(crate) fn remove_account_synthetic_device(state: &AppState, uid: &str) {
 /// market_user_id/session_id 无本地来源：无既有条目时按 uid 派生补全三元组（派生
 /// device_id 弃用）；已有条目保留原 market/session 值（不覆盖 device_proxy 捕获的
 /// 真实三元组中的非关键字段），device_id 始终以最新登录设备为准（新 JWT 校验口径）
-fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
+fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str, machine_id: &str) {
     if uid.is_empty() || device_id.is_empty() {
         return;
     }
@@ -536,15 +543,28 @@ fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
             device_id: String::new(),
             market_user_id: d.market_user_id,
             session_id: d.session_id,
+            machine_id: None,
         }
     });
+    let mut changed = false;
     if entry.device_id != device_id {
         entry.device_id = device_id.to_string();
+        changed = true;
+    }
+    // 机器码与设备同源落库：推理/模型同步不再各自派生（避免登录与调用阶段
+    // 自报不同 machine_id 的内部矛盾）
+    if !machine_id.is_empty() && entry.machine_id.as_deref() != Some(machine_id) {
+        entry.machine_id = Some(machine_id.to_string());
+        changed = true;
+    }
+    if changed {
         // 写回失败不阻断登录（下次登录重写，仅损失一次指纹同源）
         let _ = crate::store::docs::device_map_save(&store, &map);
         fs_utils::app_log(
             &state.data_dir,
-            &format!("[OAuth登录] 回写 device_map[{uid}] device_id={device_id}（JWT 与签到设备指纹同源）"),
+            &format!(
+                "[OAuth登录] 回写 device_map[{uid}] device_id={device_id} machine_id={machine_id}（JWT 与调用指纹同源）"
+            ),
         );
     }
 }
@@ -615,7 +635,12 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
     // 记录本机登录会话（CSRF + PKCE + 会话设备）供回调校验/交换/回写使用
     {
         let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(PendingLogin { state: trace_id.clone(), pkce_verifier, device_id: device_id.clone() });
+        *guard = Some(PendingLogin {
+            state: trace_id.clone(),
+            pkce_verifier,
+            device_id: device_id.clone(),
+            machine_id: machine_id.clone(),
+        });
     }
 
     OAuthLoginUrl {
@@ -735,12 +760,25 @@ pub fn oauth_parse_callback(
     // exchange_code（分钟级网络调用）独立选定，期间重叠登录会话整体覆盖写入
     // LAST_OAUTH_STATE，会让两处选中不同设备 → 实际交换设备与 device_map 回写/
     // 刷新交换设备错配。去重仅消除窗口期漂移。
-    let fallback_device = LAST_OAUTH_STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|p| p.device_id.clone())
-        .unwrap_or_else(|| fallback_login_device_id(state));
+    // 会话设备与机器码一次性取出（无在途会话时按同一凭证回查），
+    // 保证回调透传、刷新交换、device_map 回写三处同源
+    let (fallback_device, fallback_machine) = {
+        let pending = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| (p.device_id.clone(), p.machine_id.clone()));
+        match pending {
+            Some((d, m)) if !d.is_empty() => (d, m),
+            _ => {
+                let d = fallback_login_device_id(state);
+                let m = find_cred_by_device(state, &d)
+                    .map(|c| c.machine_id)
+                    .unwrap_or_default();
+                (d, m)
+            }
+        }
+    };
 
     let mut access_token = params
         .get("accessToken")
@@ -790,9 +828,10 @@ pub fn oauth_parse_callback(
         user_id,
         user_name,
         avatar,
-        // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一台
+        // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一套
         //（与 AuthCode 交换共用入口选定值，防分钟级交换窗口内两处漂移）
         device_id: Some(fallback_device),
+        machine_id: (!fallback_machine.is_empty()).then_some(fallback_machine),
     })
 }
 
@@ -1493,24 +1532,32 @@ fn try_refresh_variant(
 
 /// GetUserInfo：获取用户信息
 fn get_user_info(access_token: &str) -> Result<(String, String), String> {
-    let auth = if access_token.starts_with("Cloud-IDE-JWT ") {
-        access_token.to_string()
-    } else {
-        format!("Cloud-IDE-JWT {}", access_token)
-    };
+    // 真实 Trae CN：GetUserInfo 走 api.trae.cn + x-cloudide-token（裸 JWT），
+    // body 必须带 ReqSource/IDEVersion；历史上用 authorization 头 + 空 body 是旧形态
+    let token = access_token
+        .strip_prefix("Cloud-IDE-JWT ")
+        .unwrap_or(access_token)
+        .trim();
 
     let resp = exchange_agent()?
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
-        .set("authorization", &auth)
+        .post("https://api.trae.cn/cloudide/api/v3/trae/GetUserInfo")
+        .set("x-cloudide-token", token)
         .set("content-type", "application/json")
         .set("accept", "*/*")
-        .send_json(ureq::json!({}))
+        .send_json(ureq::json!({
+            "ReqSource": crate::trae_identity::req_source(),
+            "IDEVersion": crate::trae_identity::app_version(),
+        }))
         .map_err(|e| format!("GetUserInfo 请求失败: {}", e))?;
 
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let data = body.get("data").or(body.get("result")).ok_or("响应中缺少 data 字段")?;
+    let data = body
+        .get("data")
+        .or_else(|| body.get("result"))
+        .or_else(|| body.get("Result"))
+        .ok_or("响应中缺少 data 字段")?;
 
     let user_id = data
         .get("user_id")
@@ -1525,6 +1572,7 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
         .or_else(|| data.get("user_name"))
         .or_else(|| data.get("userName"))
         .or_else(|| data.get("nickname"))
+        .or_else(|| data.get("ScreenName"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -1595,6 +1643,16 @@ pub fn oauth_login(
         .device_id
         .clone()
         .unwrap_or_else(|| select_login_device(state).0);
+    // 机器码与设备同源：回调未透传时按同一凭证回查（真实凭证/合成凭证均可命中）
+    let login_machine_id = callback_info
+        .machine_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            find_cred_by_device(state, &login_device_id)
+                .map(|c| c.machine_id)
+                .unwrap_or_default()
+        });
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
     // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
@@ -1698,7 +1756,7 @@ pub fn oauth_login(
     // 4.5 issue #76 次因修复：新 JWT 绑定本次登录设备，立即回写 device_map——
     // 签到/积分查询经 get_device_for/resolve_device 取该设备，x-device-id 与 JWT
     // 同源（此前不回写，签到路径派生另一台伪设备，新 JWT 严格校验指纹时被拒）
-    writeback_oauth_device(state, &user_id, &login_device_id);
+    writeback_oauth_device(state, &user_id, &login_device_id, &login_machine_id);
     // Web-only 每登录会话合成身份：成功拿到 uid 后落为该账号身份，供后续刷新
     // DeviceProof 使用。删除账号时同步移除，重新 OAuth 即生成新设备。
     if let Some(cred) = take_pending_login_device(state, &login_device_id) {
@@ -1918,6 +1976,7 @@ mod oauth_tests {
             device_id: device_id.to_string(),
             market_user_id: None,
             session_id: None,
+            machine_id: None,
         }
     }
 
