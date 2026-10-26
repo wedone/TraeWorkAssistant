@@ -1385,11 +1385,28 @@ export interface SanitizeMapView {
   builtin?: boolean;
 }
 
-// ---- 实机环境档案（client_profile_import；真机 JSON → 网关全局身份）----
-// imported=false 时 profile 为当前生效的内置/本机扫描值，便于前端对照
-export interface ClientProfileView {
-  imported: boolean;
-  profile: {
+// ---- 实机环境设备池（client_profile_*；真机 JSON → 池内条目，账号按需绑定）----
+/** 池内一台真机（绝不含私钥） */
+export interface ClientDeviceView {
+  device_id: string;
+  machine_id: string;
+  app_version: string;
+  version_code: string;
+  device_model: string;
+  os_version: string;
+  /** 是否已随档案导入真机 icube 私钥（DeviceInfo/DeviceProof 用） */
+  has_private_key: boolean;
+  /** 绑定到该设备的账号 uid 列表 */
+  bound_uids: string[];
+}
+
+/** 设备池 + 账号绑定视图；未出现在 bindings 的账号走派生/合成身份 */
+export interface ClientProfilePoolView {
+  devices: ClientDeviceView[];
+  /** uid → device_id */
+  bindings: Record<string, string>;
+  /** 未绑定账号实际使用的内置身份，供前端对照 */
+  builtin: {
     app_version: string;
     build_version: string;
     version_code: string;
@@ -1402,14 +1419,7 @@ export interface ClientProfileView {
     device_model: string;
     device_manufacturer: string;
     cpu: string;
-    /** 已导入时才有值；未导入为空串 */
     device_id: string;
     machine_id: string;
   };
-  /** 已导入档案的 device_id（未导入为空串） */
-  device_id: string;
-  /** 已导入档案的 machine_id（未导入为空串） */
-  machine_id: string;
-  /** 是否已随档案导入真机 icube 私钥（DeviceInfo/DeviceProof 用） */
-  has_private_key: boolean;
 }

@@ -107,11 +107,24 @@ fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
 pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, String> {
     let state: &AppState = &admin.state;
     match name {
-        // ==================== 实机环境档案（UI 导入） ====================
+        // ==================== 实机环境设备池（UI 导入 + 账号绑定） ====================
         "client_profile_get" => to_json(client_profile::client_profile_get(state)),
         "client_profile_import" => {
             let content = arg(&args, "content")?;
             client_profile::client_profile_import(state, content).and_then(to_json)
+        }
+        "client_profile_bind" => {
+            let uid = arg(&args, "uid")?;
+            let device_id = arg(&args, "device_id")?;
+            client_profile::client_profile_bind(state, uid, device_id).and_then(to_json)
+        }
+        "client_profile_unbind" => {
+            let uid = arg(&args, "uid")?;
+            client_profile::client_profile_unbind(state, uid).and_then(to_json)
+        }
+        "client_profile_delete" => {
+            let device_id = arg(&args, "device_id")?;
+            client_profile::client_profile_delete(state, device_id).and_then(to_json)
         }
         "client_profile_clear" => client_profile::client_profile_clear(state).and_then(to_json),
         // ==================== accounts（账号/分组/积分） ====================
@@ -518,7 +531,11 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         }
 
         // ==================== oauth（OAuth 登录） ====================
-        "oauth_get_login_url" => to_json(oauth::oauth_get_login_url(state)),
+        "oauth_get_login_url" => {
+            // bound_uid：重新登录已有账号时传入，取该账号绑定的实机设备
+            let bound_uid = opt_arg(&args, "bound_uid")?;
+            to_json(oauth::oauth_get_login_url(state, bound_uid))
+        }
         "oauth_parse_callback" => {
             let callback_url = arg(&args, "callback_url")?;
             oauth::oauth_parse_callback(state, callback_url).and_then(to_json)

@@ -340,10 +340,8 @@ fn find_cred_by_device(
     device_id: &str,
 ) -> Option<crate::icube_auth::DeviceCredential> {
     let store = crate::store::db(&state.data_dir);
-    // 实机环境档案（UI 导入）的凭证优先：它与授权 URL 声明的 device_id 同源
-    if let Some(cred) = crate::commands::client_profile::imported_credential(&state.data_dir)
-        .filter(|c| c.device_id == device_id)
-    {
+    // 实机环境池中的凭证优先：它与授权 URL 声明的 device_id 同源
+    if let Some(cred) = crate::commands::client_profile::pool_credential(&state.data_dir, device_id) {
         return Some(cred);
     }
     // OAuth 登录窗口内，pending synthetic 身份尚未绑定 uid（uid 要等 JWT 解析后才
@@ -410,14 +408,18 @@ fn select_credential_index(
         .map(|(i, _)| i)
 }
 
-/// 选定本次登录使用的设备：本机有凭证时取「已绑定账号数最少」的一套
-///（issue #76 轮转），machine_id 取凭证自带值（与 ExchangeToken DeviceInfo
-/// .MachineID 同源，对齐真实客户端 URL 参数 = telemetry.machineId）；
-/// Web-only 无本机凭证时为本次登录生成 synthetic 身份
-fn select_login_device(state: &AppState) -> (String, String) {
-    // 实机环境档案（UI 导入）：全局唯一设备优先，保证新登录与真机一致
-    if let Some((device_id, machine_id)) = crate::trae_identity::imported_login_device() {
-        return (device_id, machine_id);
+/// 选定本次登录使用的设备：账号绑定的实机档案优先（该账号专属，绝不与其他账号
+/// 共用）；未绑定则取本机凭证中「已绑定账号数最少」的一套（issue #76 轮转），
+/// machine_id 取凭证自带值（与 ExchangeToken DeviceInfo.MachineID 同源，对齐真实
+/// 客户端 URL 参数 = telemetry.machineId）；Web-only 无本机凭证时为本次登录生成
+/// synthetic 身份。
+///
+/// `bound_uid`：已知账号（重新登录/刷新）时传入，用于查绑定表；新登录为 None。
+fn select_login_device(state: &AppState, bound_uid: Option<&str>) -> (String, String) {
+    if let Some(uid) = bound_uid.filter(|u| !u.is_empty()) {
+        if let Some((device_id, machine_id)) = crate::trae_identity::bound_device(uid) {
+            return (device_id, machine_id);
+        }
     }
     let creds = icube_device_creds(&state.data_dir);
     if !creds.is_empty() {
@@ -475,7 +477,7 @@ fn generate_and_persist_login_device(
 /// 避免重新生成覆盖旧身份导致交换设备与授权会话漂移；pending 缺失或桌面有本机
 /// 凭证时按既有轮转规则重选（Web-only 下会生成新 pending 覆盖旧值，此时旧身份已
 /// 无法与本次回调对应，属可接受损失）
-fn fallback_login_device_id(state: &AppState) -> String {
+fn fallback_login_device_id(state: &AppState, bound_uid: Option<&str>) -> String {
     if icube_device_creds(&state.data_dir).is_empty() {
         let store = crate::store::db(&state.data_dir);
         let pending: serde_json::Value =
@@ -484,7 +486,7 @@ fn fallback_login_device_id(state: &AppState) -> String {
             return cred.device_id;
         }
     }
-    select_login_device(state).0
+    select_login_device(state, bound_uid).0
 }
 
 fn take_pending_login_device(
@@ -597,10 +599,12 @@ fn pkce_pair() -> (String, String) {
 /// 302 回 auth_callback_url，回调参数为 authCodeInfo（JSON）而非 refreshToken/code。
 /// Web 粘贴回调模式（ADR-3）：服务端只构造并返回登录 URL，由用户在浏览器完成授权后
 /// 粘贴回调 URL（不再打开浏览器/启动回环监听）。
-pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
-    // issue #76：登录设备 = 本机凭证中已绑定账号数最少的一套（分散服务端每设备
-    // 绑定上限）；Web-only 无本机凭证时为本次登录生成 synthetic 身份
-    let (device_id, machine_id) = select_login_device(state);
+pub fn oauth_get_login_url(state: &AppState, bound_uid: Option<String>) -> OAuthLoginUrl {
+    // issue #76：登录设备 = 账号绑定档案（如有）→ 本机凭证中已绑定账号数最少的一套
+    // （分散服务端每设备绑定上限）；Web-only 无本机凭证时为本次登录生成 synthetic 身份
+    let (device_id, machine_id) = select_login_device(state, bound_uid.as_deref());
+    // 设备指纹与设备同源：绑定账号取其档案，否则取内置/本机值
+    let fp_uid = bound_uid.as_deref().unwrap_or("");
     // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）；
     // 真实客户端取 randomUUID()，形态为 8-4-4-4-12 的 UUID v4，而非裸 32 hex
     let trace_id = uuid_v4();
@@ -630,7 +634,7 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         &code_challenge={code_challenge}\
         &code_challenge_method=S256\
         &channel_name=common",
-        plugin_version = crate::trae_identity::build_version(),
+        plugin_version = crate::trae_identity::build_version_for(fp_uid),
         client_id = oauth_client().client_id,
         trace_id = trace_id,
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
@@ -638,10 +642,10 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         device_id = device_id,
         // 与推理/模型同步同源：真实客户端此三参数取 systemInformation，
         // x_device_brand 即 deviceModel（不是主机名），x_os_version 即 os.version()
-        device_brand = urlencoding::encode(crate::trae_identity::device_model()),
-        device_type = crate::trae_identity::os_name(),
-        os_version = urlencoding::encode(crate::trae_identity::os_version()),
-        app_version = crate::trae_identity::app_version(),
+        device_brand = urlencoding::encode(crate::trae_identity::device_model_for(fp_uid)),
+        device_type = crate::trae_identity::os_name_for(fp_uid),
+        os_version = urlencoding::encode(crate::trae_identity::os_version_for(fp_uid)),
+        app_version = crate::trae_identity::app_version_for(fp_uid),
         code_challenge = code_challenge,
     );
 
@@ -784,7 +788,7 @@ pub fn oauth_parse_callback(
         match pending {
             Some((d, m)) if !d.is_empty() => (d, m),
             _ => {
-                let d = fallback_login_device_id(state);
+                let d = fallback_login_device_id(state, None);
                 let m = find_cred_by_device(state, &d)
                     .map(|c| c.machine_id)
                     .unwrap_or_default();
@@ -899,6 +903,9 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // 主变体（真实客户端形态）：DeviceInfo 对象 + IDEVersion，无 DeviceProof
     if let Some(ref cred) = cred {
+        // 设备指纹按凭证所属设备取：池内凭证用真机档案值，合成/本机凭证用内置值
+        let fp_uid = crate::trae_identity::uid_of_device(&state.data_dir, &cred.device_id)
+            .unwrap_or_default();
         let pub_pem = crate::icube_auth::device_public_key_pem(&cred)
             .unwrap_or_default();
         let url = format!("{}/trae/api/v3/oauth/ExchangeToken", host.trim_end_matches('/'));
@@ -917,13 +924,13 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
                     "DeviceName": "",
                     // 与推理/模型同步共用同一份设备指纹（trae_identity::profile），
                     // 真实客户端此五字段非空，留空本身即反常
-                    "DeviceModel": crate::trae_identity::device_model(),
+                    "DeviceModel": crate::trae_identity::device_model_for(&fp_uid),
                     "ClientVersion": cred.app_version,
                     "DevicePublicKey": pub_pem,
-                    "DeviceBrand": crate::trae_identity::device_manufacturer(),
-                    "DeviceCPU": crate::trae_identity::cpu(),
-                    "OSInfo": crate::trae_identity::os_name(),
-                    "OSVersion": crate::trae_identity::os_version(),
+                    "DeviceBrand": crate::trae_identity::device_manufacturer_for(&fp_uid),
+                    "DeviceCPU": crate::trae_identity::cpu_for(&fp_uid),
+                    "OSInfo": crate::trae_identity::os_name_for(&fp_uid),
+                    "OSVersion": crate::trae_identity::os_version_for(&fp_uid),
                 },
                 "IDEVersion": cred.app_version,
             }),
@@ -1656,7 +1663,7 @@ pub fn oauth_login(
     let login_device_id = callback_info
         .device_id
         .clone()
-        .unwrap_or_else(|| select_login_device(state).0);
+        .unwrap_or_else(|| select_login_device(state, expect_uid.as_deref()).0);
     // 机器码与设备同源：回调未透传时按同一凭证回查（真实凭证/合成凭证均可命中）
     let login_machine_id = callback_info
         .machine_id

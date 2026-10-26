@@ -16,7 +16,7 @@ import type {
   BuddyAiUsageOfficialAll,
   CheckinOpts,
   CheckinTrendPoint,
-  ClientProfileView,
+  ClientProfilePoolView,
   CreditDetail,
   CreditsDailySnapshot,
   CustomModel,
@@ -732,12 +732,18 @@ export const api = {
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled }),
   },
-  // 实机环境档案（UI「实机环境」页签）：真机导出 JSON → 后端解密并全局生效
+  // 实机环境设备池（UI「实机环境」页签）：真机导出 JSON → 入池，账号再绑定
   clientProfile: {
-    get: () => invoke<ClientProfileView>('client_profile_get'),
+    get: () => invoke<ClientProfilePoolView>('client_profile_get'),
+    // 按 device_id 去重后入池，不自动绑定任何账号
     import: (content: string) =>
-      invoke<ClientProfileView>('client_profile_import', { content }),
-    clear: () => invoke<ClientProfileView>('client_profile_clear'),
+      invoke<ClientProfilePoolView>('client_profile_import', { content }),
+    bind: (uid: string, deviceId: string) =>
+      invoke<ClientProfilePoolView>('client_profile_bind', { uid, deviceId }),
+    unbind: (uid: string) => invoke<ClientProfilePoolView>('client_profile_unbind', { uid }),
+    delete: (deviceId: string) =>
+      invoke<ClientProfilePoolView>('client_profile_delete', { deviceId }),
+    clear: () => invoke<ClientProfilePoolView>('client_profile_clear'),
   },
   // ---- WB 手工路由配置（wb_route_config / wb_template_map）----
   wbConfig: {
@@ -757,7 +763,9 @@ export const api = {
     fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
   },
   oauth: {
-    getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
+    // boundUid：用该账号绑定的真机身份生成登录链接（未绑定传空即走合成身份）
+    getLoginUrl: (boundUid?: string) =>
+      invoke<OAuthLoginUrl>('oauth_get_login_url', { boundUid: boundUid ?? null }),
     parseCallback: (callbackUrl: string) =>
       invoke('oauth_parse_callback', { callbackUrl }),
     login: (callbackUrl: string, accountName?: string, groupId?: string, expectUid?: string) =>

@@ -51,11 +51,15 @@ pub fn identity() -> &'static TraeIdentity {
     IDENTITY.get_or_init(resolve)
 }
 
-/// 实机环境导入档案（UI「实机环境」页签导入，进程级生效）。
+/// 实机环境档案（UI「实机环境」页签导入的设备池条目）。
 ///
 /// 用途：网关部署在无法安装 Trae 客户端的机器（如 Debian）时，用真机导出的
 /// 档案覆盖内置/本机扫描值，使登录、推理、模型同步声称的身份与真机一致。
 /// 字段为空表示该项不覆盖，继续走内置解析值。
+///
+/// 作用域：**账号级**。档案进入设备池后由 `client_profile` 的绑定表决定哪个
+/// 账号使用它；未绑定账号一律走内置/派生身份，绝不共享同一台真机（多账号
+/// 共用一台真机会在上游形成设备聚集，正是风控识别的典型特征）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImportedProfile {
     #[serde(default)]
@@ -81,7 +85,7 @@ pub struct ImportedProfile {
     pub device_manufacturer: String,
     #[serde(default)]
     pub cpu: String,
-    /// 真机 deviceId（全局唯一设备，登录优先使用）
+    /// 真机 deviceId（该档案唯一设备，仅绑定它的账号使用）
     #[serde(default)]
     pub device_id: String,
     /// 真机 machineId（telemetry.machineId）
@@ -89,73 +93,170 @@ pub struct ImportedProfile {
     pub machine_id: String,
 }
 
-/// 导入档案覆盖（None = 未导入，全部走内置解析）。
-/// 存入的引用由 Box::leak 获得，进程内恒存活，故可安全返回 &'static。
-static IMPORTED: RwLock<Option<&'static ImportedProfile>> = RwLock::new(None);
-
-/// 应用实机档案（重复导入以新值覆盖旧值；旧引用随进程结束释放）
-pub fn apply_imported(profile: ImportedProfile) {
-    let leaked: &'static ImportedProfile = Box::leak(Box::new(profile));
-    *IMPORTED.write().unwrap_or_else(|e| e.into_inner()) = Some(leaked);
+/// 档案绑定摘要（进程内热副本，数据源是 `client_profile` 的设备池 + 绑定表）。
+///
+/// 只存 uid → device_id 与 device_id → 身份字段，不含私钥（私钥按需从 kv 取）。
+/// 用 Arc 整体替换，避免长期持锁；身份 getter 每次只做一次 Arc clone。
+#[derive(Debug, Default)]
+pub struct ProfileBindings {
+    /// uid → 档案 device_id
+    uid_to_device: std::collections::HashMap<String, String>,
+    /// 档案 device_id → 档案身份字段
+    devices: std::collections::HashMap<String, ImportedProfile>,
 }
 
-/// 清除实机档案，回退内置/本机扫描值
-pub fn clear_imported() {
-    *IMPORTED.write().unwrap_or_else(|e| e.into_inner()) = None;
+impl ProfileBindings {
+    pub fn set_binding(&mut self, uid: String, device_id: String) {
+        self.uid_to_device.insert(uid, device_id);
+    }
+
+    pub fn set_devices(&mut self, devices: std::collections::HashMap<String, ImportedProfile>) {
+        self.devices = devices;
+    }
 }
 
-/// 当前生效的导入档案（未导入为 None）
-fn imported() -> Option<&'static ImportedProfile> {
-    *IMPORTED.read().unwrap_or_else(|e| e.into_inner())
+static BINDINGS: RwLock<Option<std::sync::Arc<ProfileBindings>>> = RwLock::new(None);
+
+/// 应用绑定摘要（设备池或绑定表变更后调用；空表等价清除）
+pub fn apply_bindings(bindings: ProfileBindings) {
+    let b = std::sync::Arc::new(bindings);
+    *BINDINGS.write().unwrap_or_else(|e| e.into_inner()) = Some(b);
 }
 
-/// 导入档案中非空的 device_id / machine_id（全局唯一设备用）
-pub fn imported_login_device() -> Option<(String, String)> {
-    let p = imported()?;
+/// 清除绑定摘要（无档案或无任何绑定账号时调用）
+pub fn clear_bindings() {
+    *BINDINGS.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn bindings() -> Option<std::sync::Arc<ProfileBindings>> {
+    BINDINGS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 按账号取生效档案：未绑定（或档案已被删除）返回 None，调用方回落内置身份。
+/// `uid` 为空（如全局同步等无账号上下文场景）同样返回 None。
+pub fn profile_for(uid: &str) -> Option<&'static ImportedProfile> {
+    if uid.is_empty() {
+        return None;
+    }
+    // 绑定的档案在进程生命周期内不会被换掉（重新导入只会替换内容，device_id 不变），
+    // 故取一次即与 Arc 同寿命；泄漏量等于设备池条目数，可忽略
+    let b = bindings()?;
+    let device_id = b.uid_to_device.get(uid)?;
+    let p = b.devices.get(device_id)?;
+    Some(Box::leak(Box::new(p.clone())))
+}
+
+/// 账号绑定档案的 device_id / machine_id（登录选设备用）
+pub fn bound_device(uid: &str) -> Option<(String, String)> {
+    let p = profile_for(uid)?;
     if p.device_id.is_empty() || p.machine_id.is_empty() {
         return None;
     }
     Some((p.device_id.clone(), p.machine_id.clone()))
 }
 
-/// 客户端版本，如 "3.4.4"
-pub fn app_version() -> &'static str {
-    match imported() {
-        Some(p) if !p.app_version.is_empty() => &p.app_version,
-        _ => &identity().app_version,
+/// 反查设备池：该 device_id 当前绑定到的账号 uid（未绑定返回 None）。
+///
+/// 用于只有 device_id、需要取该设备指纹字段的场景（如 AuthCode 交换的 DeviceInfo）。
+pub fn uid_of_device(data_dir: &std::path::Path, device_id: &str) -> Option<String> {
+    if device_id.is_empty() {
+        return None;
     }
+    let map: std::collections::HashMap<String, String> = crate::store::db(data_dir)
+        .kv_get("client_profile_bindings");
+    map.into_iter()
+        .find(|(_, d)| d == device_id)
+        .map(|(uid, _)| uid)
+}
+
+/// 取档案字段：绑定档案非空优先，否则内置值
+macro_rules! pick {
+    ($uid:expr, $field:ident, $fallback:expr) => {{
+        match profile_for($uid) {
+            Some(p) if !p.$field.is_empty() => p.$field.as_str(),
+            _ => $fallback,
+        }
+    }};
+}
+
+/// 客户端版本，如 "3.4.4"（`uid` 为当前请求所属账号；空串取内置值）
+pub fn app_version_for(uid: &str) -> &'static str {
+    pick!(uid, app_version, app_version())
+}
+
+/// 构建号，如 "2.3.93438"
+pub fn build_version_for(uid: &str) -> &'static str {
+    pick!(uid, build_version, build_version())
+}
+
+/// TTNet 版本号，如 "344"
+pub fn version_code_for(uid: &str) -> &'static str {
+    pick!(uid, version_code, version_code())
+}
+
+/// 包类型，如 "stable_cn"
+pub fn package_type_for(uid: &str) -> &'static str {
+    pick!(uid, package_type, package_type())
+}
+
+/// 客户端 appId，如 "787976"
+pub fn app_id_for(uid: &str) -> &'static str {
+    pick!(uid, app_id, app_id())
+}
+
+/// IDE 侧版本码（x-ide-version-code），如 "20260212"
+pub fn ide_version_code_for(uid: &str) -> &'static str {
+    pick!(uid, ide_version_code, ide_version_code())
+}
+
+/// 操作系统名（x-device-type）
+pub fn os_name_for(uid: &str) -> &'static str {
+    pick!(uid, os_name, os_name())
+}
+
+/// 操作系统版本（x-os-version）
+pub fn os_version_for(uid: &str) -> &'static str {
+    pick!(uid, os_version, os_version())
+}
+
+/// 设备型号（x-device-brand / DeviceInfo.DeviceModel）
+pub fn device_model_for(uid: &str) -> &'static str {
+    pick!(uid, device_model, device_model())
+}
+
+/// 设备厂商（DeviceInfo.DeviceBrand）
+pub fn device_manufacturer_for(uid: &str) -> &'static str {
+    pick!(uid, device_manufacturer, device_manufacturer())
+}
+
+/// CPU 厂商（x-device-cpu / DeviceInfo.DeviceCPU）
+pub fn cpu_for(uid: &str) -> &'static str {
+    pick!(uid, cpu, cpu())
+}
+
+/// 客户端版本，如 "3.4.4"（无账号上下文的内置值）
+pub fn app_version() -> &'static str {
+    &identity().app_version
 }
 
 /// 构建号，如 "2.3.93438"
 pub fn build_version() -> &'static str {
-    match imported() {
-        Some(p) if !p.build_version.is_empty() => &p.build_version,
-        _ => &identity().build_version,
-    }
+    &identity().build_version
 }
 
 /// 版本号（数字递增），如 "344"
 pub fn version_code() -> &'static str {
-    match imported() {
-        Some(p) if !p.version_code.is_empty() => &p.version_code,
-        _ => &identity().version_code,
-    }
+    &identity().version_code
 }
 
 /// 包类型，如 "stable_cn"
 pub fn package_type() -> &'static str {
-    match imported() {
-        Some(p) if !p.package_type.is_empty() => &p.package_type,
-        _ => &identity().package_type,
-    }
+    &identity().package_type
 }
 
 /// 客户端 appId，如 "787976"
 pub fn app_id() -> &'static str {
-    match imported() {
-        Some(p) if !p.app_id.is_empty() => &p.app_id,
-        _ => &identity().app_id,
-    }
+    &identity().app_id
 }
 
 /// 请求来源标识，如 "IDE"
@@ -165,10 +266,7 @@ pub fn req_source() -> &'static str {
 
 /// IDE 侧版本码（x-ide-version-code），如 "20260212"
 pub fn ide_version_code() -> &'static str {
-    match imported() {
-        Some(p) if !p.ide_version_code.is_empty() => &p.ide_version_code,
-        _ => &identity().ide_version_code,
-    }
+    &identity().ide_version_code
 }
 
 fn resolve() -> TraeIdentity {
@@ -321,44 +419,29 @@ pub fn profile() -> &'static ClientProfile {
     PROFILE.get_or_init(resolve_profile)
 }
 
-/// 操作系统名（x-device-type 取值）
+/// 操作系统名（x-device-type 取值，无账号上下文的内置值）
 pub fn os_name() -> &'static str {
-    match imported() {
-        Some(p) if !p.os_name.is_empty() => &p.os_name,
-        _ => &profile().os_name,
-    }
+    &profile().os_name
 }
 
 /// 操作系统版本（x-os-version / DeviceInfo.OSVersion 取值）
 pub fn os_version() -> &'static str {
-    match imported() {
-        Some(p) if !p.os_version.is_empty() => &p.os_version,
-        _ => &profile().os_version,
-    }
+    &profile().os_version
 }
 
 /// 设备型号（x-device-brand / DeviceInfo.DeviceModel 取值）
 pub fn device_model() -> &'static str {
-    match imported() {
-        Some(p) if !p.device_model.is_empty() => &p.device_model,
-        _ => &profile().device_model,
-    }
+    &profile().device_model
 }
 
 /// 设备厂商（DeviceInfo.DeviceBrand 取值）
 pub fn device_manufacturer() -> &'static str {
-    match imported() {
-        Some(p) if !p.device_manufacturer.is_empty() => &p.device_manufacturer,
-        _ => &profile().device_manufacturer,
-    }
+    &profile().device_manufacturer
 }
 
 /// CPU 厂商（x-device-cpu / DeviceInfo.DeviceCPU 取值）
 pub fn cpu() -> &'static str {
-    match imported() {
-        Some(p) if !p.cpu.is_empty() => &p.cpu,
-        _ => &profile().cpu,
-    }
+    &profile().cpu
 }
 
 fn resolve_profile() -> ClientProfile {

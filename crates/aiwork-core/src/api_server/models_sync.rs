@@ -248,19 +248,19 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         .filter_map(|a| {
             let uid = a.user_id.as_deref()?.to_string();
             let entry = device_map.get(&uid);
-            // 绝不发送空 x-device-id：无 device_map 条目时优先回落实机环境档案的
-            // 全局设备，其次派生设备（与推理侧同源）
-            let imported = crate::trae_identity::imported_login_device();
+            // 绝不发送空 x-device-id：无 device_map 条目时优先回落该账号绑定的
+            // 实机档案设备，其次派生设备（与推理侧同源，绑定是账号级的）
+            let bound = crate::trae_identity::bound_device(&uid);
             let device_id = entry
                 .map(|d| d.device_id.clone())
                 .filter(|s| !s.is_empty())
-                .or_else(|| imported.as_ref().map(|(d, _)| d.clone()))
+                .or_else(|| bound.as_ref().map(|(d, _)| d.clone()))
                 .unwrap_or_else(|| crate::commands::accounts::derive_device(&uid).device_id);
-            // machine_id 与登录/推理同源：优先 device_map 回写值，其次实机档案，缺省按 uid 派生
+            // machine_id 与登录/推理同源：优先 device_map 回写值，其次绑定档案，缺省按 uid 派生
             let machine_id = entry
                 .and_then(|d| d.machine_id.clone())
                 .filter(|s| !s.is_empty())
-                .or_else(|| imported.map(|(_, m)| m))
+                .or_else(|| bound.map(|(_, m)| m))
                 .unwrap_or_else(|| super::pool::seeded_hex(64, &uid, "mach"));
             Some((a, device_id, machine_id))
         })
@@ -295,6 +295,8 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     let mut last_err = String::new();
     let mut parsed: Option<Vec<ModelOption>> = None;
     for (account, device_id, machine_id) in &candidates {
+        // 版本与设备指纹按账号取：绑定实机档案时用真机值，否则实例内置值
+        let uid = account.user_id.as_deref().unwrap_or("");
         // 存储惯例：jwt 可能带 `Cloud-IDE-JWT ` 前缀（自动捕获/本地抓取/刷新链路均
         // 规范化为带前缀写入）。mchost.guru 网关的 x-ide-token 只接受裸 JWT，
         // 带前缀会被网关在 token 校验前统一拒绝（401 code 1001，与垃圾 token 同型
@@ -302,10 +304,10 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         // 时的 strip_prefix 行为。
         let jwt_raw = account.jwt.trim();
         let jwt_clean = jwt_raw.strip_prefix("Cloud-IDE-JWT ").unwrap_or(jwt_raw).trim();
-        // T4：版本身份与推理请求同源（实例级唯一身份，不按账号分流）
-        let ide_ver = super::ide_version();
-        let ide_ver_code = super::ide_version_code();
-        let app_ver_code = super::app_version_code();
+        // T4：版本身份与推理请求同源
+        let ide_ver = super::ide_version(uid);
+        let ide_ver_code = super::ide_version_code(uid);
+        let app_ver_code = super::app_version_code(uid);
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
@@ -315,22 +317,22 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("x-app-version", "default")
             .set("x-app-version-code", app_ver_code)
             .set("x-bridge-transport", "aha")
-            .set("x-device-brand", crate::trae_identity::device_model())
-            .set("x-device-cpu", crate::trae_identity::cpu())
+            .set("x-device-brand", crate::trae_identity::device_model_for(uid))
+            .set("x-device-cpu", crate::trae_identity::cpu_for(uid))
             .set("x-device-id", device_id)
-            .set("x-device-type", crate::trae_identity::os_name())
+            .set("x-device-type", crate::trae_identity::os_name_for(uid))
             .set("x-ide-token", jwt_clean)
             .set("x-ide-version", ide_ver)
             .set("x-ide-version-code", ide_ver_code)
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
-            .set("x-os-version", crate::trae_identity::os_version())
-            .set("package-type", super::package_type())
-            .set("x-lscbd-aid", crate::trae_identity::app_id())
+            .set("x-os-version", crate::trae_identity::os_version_for(uid))
+            .set("package-type", super::package_type(uid))
+            .set("x-lscbd-aid", crate::trae_identity::app_id_for(uid))
             .set("x-lscbd-platform", "windows")
             .set("app-version", ide_ver)
-            .set("x-ss-dp", crate::trae_identity::app_id())
+            .set("x-ss-dp", crate::trae_identity::app_id_for(uid))
             .send_json(body.clone());
 
         match resp {

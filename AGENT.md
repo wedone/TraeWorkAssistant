@@ -190,7 +190,11 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 - **客户端身份为实例级唯一**（`api_pool.json.trae_ide_legacy`）：`false`（默认）= Trae CN IDE 真实身份 `3.4.4 / 344 / solo_agent`，`true` = 旧 SOLO 线 `0.1.50 / 20260811 / solo_work_lite`。禁止按 uid 分流——同一台机器对不同账号声称不同版本本身就是风控信号。
 - **版本码有两个口径，不可混用**：`x-app-version-code`/TTNet = `344`（manifest `ahaNet.ttnet_params.version_code`）；`x-ide-version-code` = `20260212`（客户端内置 domain config，2026-10-26 ai-completion 日志实证）。`x-app-version` 固定 `default`（domain config `api.appVersion`）。
 - **设备指纹单一来源** `trae_identity::ClientProfile`：`os_name=windows`、`os_version=Windows 10 Pro`、`device_model=INVALID`、`device_manufacturer=LENOVO`、`cpu=Intel`（本机 WMI/注册表 + `os.version()` 实测，环境变量可覆盖）。推理头、模型同步、登录 URL、ExchangeToken DeviceInfo 四路必须同源，禁止各调用点自行硬编码。
-- **实机环境档案**（UI「实机环境」页签，`scripts/export-trae-profile.ps1|.py` 导出）为全局唯一设备：新登录与无 `device_map` 条目账号统一使用导入的 `device_id/machine_id/指纹/版本身份`；**已有 `device_map` 绑定不得改写**（改了会触发上游 `Token device not match`）。私钥仅存后端 kv，不回传前端、不写日志。
+- **实机环境为设备池 + 账号级绑定**（UI「实机环境」页签，`scripts/export-trae-profile.ps1|.py` 导出）：kv `client_profile_pool`（`Vec<ImportedProfile>`，按 `device_id` 去重）/ `client_profile_creds`（`HashMap<device_id, DeviceCredential>`）/ `client_profile_bindings`（`HashMap<uid, device_id>`）。导入只入池、**不自动绑定任何账号**；绑定由用户在页签里按账号选择。
+  - 设备选取三级：`device_map` 条目 → `trae_identity::bound_device(uid)` → `derive_device(uid)`。**未绑定账号一律走派生/合成身份，禁止复用已绑定的真机**——多账号共用一台设备是上游风控的典型特征。
+  - 身份/指纹取值一律用 `trae_identity::*_for(uid)`；`_for("")` 即内置值，供未绑定账号与进程级日志使用。禁止再引入全局单例覆盖。
+  - **已有 `device_map` 绑定不得改写**（改了会触发上游 `Token device not match`）。私钥仅存后端 kv，不回传前端、不写日志。
+  - 旧版单例档案（`client_profile` kv）启动时迁入池第 1 项后删除，不自动绑定。
 - `derive_device` 必须保持 **15 位**数字（与 Python 签到端逐位一致）；改了会造成签到与推理设备指纹漂移并触发 401。真实客户端 deviceId 为 16 位，但该路径不得对齐。
 - API 模型同步重放官网配置接口；内置模型（glm-5.3-flash 等）需 llm_utils_chat 以 `function=solo_agent` 补齐。
 - WB 官方用量上游 prompt/input 字段一律不复制（脱敏红线）。

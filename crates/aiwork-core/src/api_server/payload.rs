@@ -266,11 +266,11 @@ pub fn prepare_llm_chat_body(
     // 1M 窗口由上游内部决策，网关侧固定 168000 即可
     obj_mut.insert("prompt_max_tokens".into(), json!(168_000));
     obj_mut.insert("mode".into(), json!("FunctionCall"));
-    // T3：请求体版本身份与请求头同源（实例级唯一，不随账号变化）
-    obj_mut.insert("ide_version".into(), json!(super::ide_version()));
-    obj_mut.insert("ide_version_code".into(), json!(super::ide_version_code()));
+    // T3：请求体版本身份与请求头同源（按账号取：绑定实机档案用真机版本值）
+    obj_mut.insert("ide_version".into(), json!(super::ide_version(uid)));
+    obj_mut.insert("ide_version_code".into(), json!(super::ide_version_code(uid)));
     obj_mut.insert("app_id".into(), json!(super::APP_ID));
-    obj_mut.insert("package_type".into(), json!(super::package_type()));
+    obj_mut.insert("package_type".into(), json!(super::package_type(uid)));
 
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
 }

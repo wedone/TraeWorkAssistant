@@ -255,7 +255,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
 
     // T3/T5：Trae 池客户端线身份（实例级唯一：false=IDE 真实身份，true=旧 SOLO 线）
     super::set_trae_ide_legacy(pool_file.trae_ide_legacy);
-    // 实机环境档案（UI 导入）在进程启动时热应用，覆盖内置/本机扫描身份
+    // 实机环境池 + 账号绑定在进程启动时载入（旧单例档案迁入池，不自动绑定账号）
     crate::commands::client_profile::apply_persisted(&state.data_dir);
     fs_utils::app_log(
         &state.data_dir,
@@ -263,8 +263,8 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
             "API服务启动-Trae 身份: line={} version={}/{} function={} \
 (legacy 对照组 {}/{})",
             if pool_file.trae_ide_legacy { "legacy" } else { "ide" },
-            super::ide_version(),
-            super::ide_version_code(),
+            super::ide_version(""),
+            super::ide_version_code(""),
             super::default_function(),
             super::LEGACY_IDE_VERSION,
             super::LEGACY_IDE_VERSION_CODE,

@@ -3048,15 +3048,15 @@ fn upstream_header_digest(r: &ureq::Response, sent_trace: &str, sent_req_id: &st
 
 fn make_upstream_request(
     jwt: &str,
-    _uid: &str,
+    uid: &str,
     device_id: &str,
     machine_id: &str,
     body: &[u8],
 ) -> Result<(Box<dyn Read + Send>, String), (u16, String, Option<u64>)> {
-    // T3：版本身份实例级唯一（请求头与请求体必须同源，见 payload 同款调用）
-    let ide_ver = super::ide_version();
-    let ide_ver_code = super::ide_version_code();
-    let app_ver_code = super::app_version_code();
+    // T3：版本身份与设备指纹按账号取（请求头与请求体必须同源，见 payload 同款调用）
+    let ide_ver = super::ide_version(uid);
+    let ide_ver_code = super::ide_version_code(uid);
+    let app_ver_code = super::app_version_code(uid);
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -3079,18 +3079,18 @@ fn make_upstream_request(
         .set("x-ide-version", ide_ver)
         .set("x-ide-version-code", ide_ver_code)
         .set("x-ide-version-type", "stable")
-        .set("x-device-type", crate::trae_identity::os_name())
-        .set("x-device-brand", crate::trae_identity::device_model())
-        .set("x-device-cpu", crate::trae_identity::cpu())
+        .set("x-device-type", crate::trae_identity::os_name_for(uid))
+        .set("x-device-brand", crate::trae_identity::device_model_for(uid))
+        .set("x-device-cpu", crate::trae_identity::cpu_for(uid))
         .set("x-device-id", device_id)
         .set("x-machine-id", machine_id)
-        .set("x-os-version", crate::trae_identity::os_version())
+        .set("x-os-version", crate::trae_identity::os_version_for(uid))
         .set("request-traffic-type", "prod")
-        .set("package-type", super::package_type())
+        .set("package-type", super::package_type(uid))
         .set("x-lgw-req-sdk-type", "3")
-        .set("x-lscbd-aid", crate::trae_identity::app_id())
+        .set("x-lscbd-aid", crate::trae_identity::app_id_for(uid))
         .set("x-lscbd-platform", "windows")
-        .set("x-ss-dp", crate::trae_identity::app_id())
+        .set("x-ss-dp", crate::trae_identity::app_id_for(uid))
         .set("app-version", ide_ver)
         .set("x-custom-trace-id", &trace_id[..16])
         .set("x-flow-traceparent", &format!("04-{}-{}-01", &trace_id[3..35], uuid_like_id()))

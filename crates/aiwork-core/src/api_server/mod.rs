@@ -49,33 +49,35 @@ pub const LEGACY_IDE_VERSION_CODE: &str = "20260811";
 /// 客户端版本 / 版本号（实例级）：统一由 `trae_identity` 提供（T1/T3），
 /// 与本机 IDE manifest 和 OAuth 授权页保持一致；旧 SOLO 线开关打开时回退旧值。
 /// 注意 IDE 线版本号是递增数字（如 344），SOLO 线才是日期格式。
-pub fn ide_version() -> &'static str {
+///
+/// `uid` 为请求所属账号：该账号绑定实机档案时取其真机版本值，否则取实例内置值。
+pub fn ide_version(uid: &str) -> &'static str {
     if trae_ide_legacy() {
         LEGACY_IDE_VERSION
     } else {
-        crate::trae_identity::app_version()
+        crate::trae_identity::app_version_for(uid)
     }
 }
 /// IDE 侧版本码（x-ide-version-code）：2026-10-26 本机 ai-completion 日志实证值
 /// `20260212`，取自客户端内置 domain config；与 TTNet 的 `344` 不是同一口径。
-pub fn ide_version_code() -> &'static str {
+pub fn ide_version_code(uid: &str) -> &'static str {
     if trae_ide_legacy() {
         LEGACY_IDE_VERSION_CODE
     } else {
-        crate::trae_identity::ide_version_code()
+        crate::trae_identity::ide_version_code_for(uid)
     }
 }
 /// TTNet 侧版本码（x-app-version-code / app-version-code）：manifest
 /// ahaNet.ttnet_params.version_code，如 "344"
-pub fn app_version_code() -> &'static str {
+pub fn app_version_code(uid: &str) -> &'static str {
     if trae_ide_legacy() {
         LEGACY_IDE_VERSION_CODE
     } else {
-        crate::trae_identity::version_code()
+        crate::trae_identity::version_code_for(uid)
     }
 }
-pub fn package_type() -> &'static str {
-    crate::trae_identity::package_type()
+pub fn package_type(uid: &str) -> &'static str {
+    crate::trae_identity::package_type_for(uid)
 }
 pub const FUNCTION: &str = "solo_work_lite";
 /// IDE 线真实 function 取值（模型目录同步的 agent_type 即 solo_agent，见 models_sync）

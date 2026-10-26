@@ -29,6 +29,9 @@ Thumbs.db
 # 运行时数据（证书、账号状态等）
 data/
 
+# 真机导出档案（含 icube 私钥，严禁提交）
+trae-client-profile*.json
+
 # test_proxy 抓包产物（完整体另存目录）
 proxy_bodies/
 # test_proxy 系统代理崩溃自愈恢复记录
