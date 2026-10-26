@@ -32,7 +32,7 @@ pub mod wb_sticky;
 pub mod wb_toolexec;
 pub mod wb_upstream;
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 pub use api_logger::ApiLogger;
@@ -43,9 +43,69 @@ pub use pool::ApiPool;
 pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
 pub const EP_LLM_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-pub const IDE_VERSION: &str = "0.1.50";
-pub const IDE_VERSION_CODE: &str = "20260811";
+/// 旧 SOLO 线身份（灰度对照组，保持改动前的线上表现）
+pub const LEGACY_IDE_VERSION: &str = "0.1.50";
+pub const LEGACY_IDE_VERSION_CODE: &str = "20260811";
+/// 客户端版本 / 版本号（实例级）：统一由 `trae_identity` 提供（T1/T3），
+/// 与本机 IDE manifest 和 OAuth 授权页保持一致；旧 SOLO 线开关打开时回退旧值。
+/// 注意 IDE 线版本号是递增数字（如 344），SOLO 线才是日期格式。
+pub fn ide_version() -> &'static str {
+    if trae_ide_legacy() {
+        LEGACY_IDE_VERSION
+    } else {
+        crate::trae_identity::app_version()
+    }
+}
+/// IDE 侧版本码（x-ide-version-code）：2026-10-26 本机 ai-completion 日志实证值
+/// `20260212`，取自客户端内置 domain config；与 TTNet 的 `344` 不是同一口径。
+pub fn ide_version_code() -> &'static str {
+    if trae_ide_legacy() {
+        LEGACY_IDE_VERSION_CODE
+    } else {
+        crate::trae_identity::ide_version_code()
+    }
+}
+/// TTNet 侧版本码（x-app-version-code / app-version-code）：manifest
+/// ahaNet.ttnet_params.version_code，如 "344"
+pub fn app_version_code() -> &'static str {
+    if trae_ide_legacy() {
+        LEGACY_IDE_VERSION_CODE
+    } else {
+        crate::trae_identity::version_code()
+    }
+}
+pub fn package_type() -> &'static str {
+    crate::trae_identity::package_type()
+}
 pub const FUNCTION: &str = "solo_work_lite";
+/// IDE 线真实 function 取值（模型目录同步的 agent_type 即 solo_agent，见 models_sync）
+pub const FUNCTION_IDE: &str = "solo_agent";
+
+/// 客户端线身份开关（实例级），由 api_pool.json.trae_ide_legacy 写入。
+/// false（默认）= Trae CN IDE 真实身份；true = 沿用旧 SOLO 线身份。
+///
+/// 进程级唯一：同一实例不会同时存在两种版本身份。旧实现按 uid 哈希分流
+/// （trae_ide_gray / trae_function_gray），会让同一台机器对不同账号声称不同
+/// 客户端版本、不同 function，属可识别的风控信号，故整体废弃。
+static TRAE_IDE_LEGACY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trae_ide_legacy(v: bool) {
+    TRAE_IDE_LEGACY.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn trae_ide_legacy() -> bool {
+    TRAE_IDE_LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 默认 function（实例级，与版本身份同源）：IDE 线 solo_agent / 旧 SOLO 线 solo_work_lite。
+/// 真实客户端 function 由 Agent 类型决定，同一客户端版本下不会混用两条产品线的取值。
+pub fn default_function() -> &'static str {
+    if trae_ide_legacy() {
+        FUNCTION
+    } else {
+        FUNCTION_IDE
+    }
+}
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 

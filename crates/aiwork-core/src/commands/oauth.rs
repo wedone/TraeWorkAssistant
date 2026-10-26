@@ -9,12 +9,14 @@ use crate::state::AppState;
 /// 最近签发的 OAuth 登录会话（CSRF 防护 + PKCE）：oauth_get_login_url 签发时记录，
 /// oauth_parse_callback 用 loginTraceID 双向绑定校验（抓包实证：login_trace_id 参数
 /// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换。
-/// device_id：本会话选定的凭证设备（issue #76 轮转 / Web-only 每登录会话合成身份）——
-/// 登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
+/// device_id / machine_id：本会话选定的凭证设备（issue #76 轮转 / Web-only 每登录
+/// 会话合成身份）——登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者
+/// 共用同一套，保证登录与调用阶段指纹同源
 struct PendingLogin {
     state: String,
     pkce_verifier: String,
     device_id: String,
+    machine_id: String,
 }
 static LAST_OAUTH_STATE: Mutex<Option<PendingLogin>> = Mutex::new(None);
 
@@ -30,9 +32,9 @@ const OAUTH_CLIENT_SECRET: &str = "-";
 /// 客户端应用 id（tech-framework §6.2：云 IDE API 附带 X-App-Id 头；旧登录 URL 曾用）
 const OAUTH_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 /// 真实 IDE 页面参数快照（抓包 2026-09-16）：授权页据此进入 native_ide 原生授权
-/// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）
-const OAUTH_PAGE_PLUGIN_VERSION: &str = "2.3.83560";
-const OAUTH_PAGE_APP_VERSION: &str = "3.3.100";
+/// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）。
+/// app_version / plugin_version 改由 `trae_identity` 提供（T2）：
+/// 本机安装 IDE 升级后自动跟随，避免登录页版本与推理请求版本再次分叉。
 const OAUTH_PAGE_PLATFORM_CODE: &str = "IDE_PC";
 /// 授权完成后的回跳地址：粘贴回调模式下浏览器跳到此本机地址「无法连接」页，
 /// 用户复制地址栏 URL 回 Web UI 提交完成登录（端口 17388 与桌面版一致）
@@ -131,6 +133,10 @@ pub struct OAuthCallbackInfo {
     /// 交换与 device_map 回写，保证整条登录链路设备同源
     #[serde(default)]
     pub device_id: Option<String>,
+    /// 与 device_id 同源的机器码：回写 device_map 后推理/模型同步复用同一值。
+    /// 仅服务端内部使用，不随命令结果回传前端
+    #[serde(default, skip_serializing)]
+    pub machine_id: Option<String>,
 }
 
 /// OAuth 登录 URL 响应
@@ -300,7 +306,8 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
             }
         }
         if dev.machine_id.is_empty() {
-            dev.machine_id = random_hex(32);
+            // 对齐真实 telemetry.machineId 形态（64 hex）
+            dev.machine_id = random_hex(64);
         }
         if dev.device_id.is_empty() {
             dev.device_id = (0..15)
@@ -333,6 +340,12 @@ fn find_cred_by_device(
     device_id: &str,
 ) -> Option<crate::icube_auth::DeviceCredential> {
     let store = crate::store::db(&state.data_dir);
+    // 实机环境档案（UI 导入）的凭证优先：它与授权 URL 声明的 device_id 同源
+    if let Some(cred) = crate::commands::client_profile::imported_credential(&state.data_dir)
+        .filter(|c| c.device_id == device_id)
+    {
+        return Some(cred);
+    }
     // OAuth 登录窗口内，pending synthetic 身份尚未绑定 uid（uid 要等 JWT 解析后才
     // 可知），必须先按 pending 设备 ID 直接命中，供 AuthCode/DeviceInfo 交换使用。
     let pending: serde_json::Value = store.kv_get(&format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX));
@@ -402,6 +415,10 @@ fn select_credential_index(
 /// .MachineID 同源，对齐真实客户端 URL 参数 = telemetry.machineId）；
 /// Web-only 无本机凭证时为本次登录生成 synthetic 身份
 fn select_login_device(state: &AppState) -> (String, String) {
+    // 实机环境档案（UI 导入）：全局唯一设备优先，保证新登录与真机一致
+    if let Some((device_id, machine_id)) = crate::trae_identity::imported_login_device() {
+        return (device_id, machine_id);
+    }
     let creds = icube_device_creds(&state.data_dir);
     if !creds.is_empty() {
         let store = crate::store::db(&state.data_dir);
@@ -434,7 +451,9 @@ fn select_login_device(state: &AppState) -> (String, String) {
 fn generate_and_persist_login_device(
     state: &AppState,
 ) -> Result<crate::icube_auth::DeviceCredential, String> {
-    let cred = crate::icube_auth::generate_synthetic_device_credential(OAUTH_PAGE_APP_VERSION)?;
+    let cred = crate::icube_auth::generate_synthetic_device_credential(
+        crate::trae_identity::app_version(),
+    )?;
     let json = serde_json::to_value(&cred)
         .map_err(|e| format!("合成设备身份序列化失败: {e}"))?;
     let key = format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX);
@@ -519,7 +538,7 @@ pub(crate) fn remove_account_synthetic_device(state: &AppState, uid: &str) {
 /// market_user_id/session_id 无本地来源：无既有条目时按 uid 派生补全三元组（派生
 /// device_id 弃用）；已有条目保留原 market/session 值（不覆盖 device_proxy 捕获的
 /// 真实三元组中的非关键字段），device_id 始终以最新登录设备为准（新 JWT 校验口径）
-fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
+fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str, machine_id: &str) {
     if uid.is_empty() || device_id.is_empty() {
         return;
     }
@@ -534,15 +553,28 @@ fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
             device_id: String::new(),
             market_user_id: d.market_user_id,
             session_id: d.session_id,
+            machine_id: None,
         }
     });
+    let mut changed = false;
     if entry.device_id != device_id {
         entry.device_id = device_id.to_string();
+        changed = true;
+    }
+    // 机器码与设备同源落库：推理/模型同步不再各自派生（避免登录与调用阶段
+    // 自报不同 machine_id 的内部矛盾）
+    if !machine_id.is_empty() && entry.machine_id.as_deref() != Some(machine_id) {
+        entry.machine_id = Some(machine_id.to_string());
+        changed = true;
+    }
+    if changed {
         // 写回失败不阻断登录（下次登录重写，仅损失一次指纹同源）
         let _ = crate::store::docs::device_map_save(&store, &map);
         fs_utils::app_log(
             &state.data_dir,
-            &format!("[OAuth登录] 回写 device_map[{uid}] device_id={device_id}（JWT 与签到设备指纹同源）"),
+            &format!(
+                "[OAuth登录] 回写 device_map[{uid}] device_id={device_id} machine_id={machine_id}（JWT 与调用指纹同源）"
+            ),
         );
     }
 }
@@ -569,11 +601,11 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
     // issue #76：登录设备 = 本机凭证中已绑定账号数最少的一套（分散服务端每设备
     // 绑定上限）；Web-only 无本机凭证时为本次登录生成 synthetic 身份
     let (device_id, machine_id) = select_login_device(state);
-    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
-    let trace_id = random_hex(32);
+    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）；
+    // 真实客户端取 randomUUID()，形态为 8-4-4-4-12 的 UUID v4，而非裸 32 hex
+    let trace_id = uuid_v4();
     let (pkce_verifier, code_challenge) = pkce_pair();
 
-    let hostname = login_page_hostname();
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\
@@ -589,8 +621,8 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         &device_id={device_id}\
         &x_device_id={device_id}\
         &x_machine_id={machine_id}\
-        &x_device_brand={hostname}\
-        &x_device_type=windows\
+        &x_device_brand={device_brand}\
+        &x_device_type={device_type}\
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
@@ -598,22 +630,30 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         &code_challenge={code_challenge}\
         &code_challenge_method=S256\
         &channel_name=common",
-        plugin_version = OAUTH_PAGE_PLUGIN_VERSION,
+        plugin_version = crate::trae_identity::build_version(),
         client_id = oauth_client().client_id,
         trace_id = trace_id,
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
         machine_id = machine_id,
         device_id = device_id,
-        hostname = urlencoding::encode(&hostname),
-        os_version = urlencoding::encode("Windows"),
-        app_version = OAUTH_PAGE_APP_VERSION,
+        // 与推理/模型同步同源：真实客户端此三参数取 systemInformation，
+        // x_device_brand 即 deviceModel（不是主机名），x_os_version 即 os.version()
+        device_brand = urlencoding::encode(crate::trae_identity::device_model()),
+        device_type = crate::trae_identity::os_name(),
+        os_version = urlencoding::encode(crate::trae_identity::os_version()),
+        app_version = crate::trae_identity::app_version(),
         code_challenge = code_challenge,
     );
 
     // 记录本机登录会话（CSRF + PKCE + 会话设备）供回调校验/交换/回写使用
     {
         let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(PendingLogin { state: trace_id.clone(), pkce_verifier, device_id: device_id.clone() });
+        *guard = Some(PendingLogin {
+            state: trace_id.clone(),
+            pkce_verifier,
+            device_id: device_id.clone(),
+            machine_id: machine_id.clone(),
+        });
     }
 
     OAuthLoginUrl {
@@ -733,12 +773,25 @@ pub fn oauth_parse_callback(
     // exchange_code（分钟级网络调用）独立选定，期间重叠登录会话整体覆盖写入
     // LAST_OAUTH_STATE，会让两处选中不同设备 → 实际交换设备与 device_map 回写/
     // 刷新交换设备错配。去重仅消除窗口期漂移。
-    let fallback_device = LAST_OAUTH_STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|p| p.device_id.clone())
-        .unwrap_or_else(|| fallback_login_device_id(state));
+    // 会话设备与机器码一次性取出（无在途会话时按同一凭证回查），
+    // 保证回调透传、刷新交换、device_map 回写三处同源
+    let (fallback_device, fallback_machine) = {
+        let pending = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| (p.device_id.clone(), p.machine_id.clone()));
+        match pending {
+            Some((d, m)) if !d.is_empty() => (d, m),
+            _ => {
+                let d = fallback_login_device_id(state);
+                let m = find_cred_by_device(state, &d)
+                    .map(|c| c.machine_id)
+                    .unwrap_or_default();
+                (d, m)
+            }
+        }
+    };
 
     let mut access_token = params
         .get("accessToken")
@@ -788,9 +841,10 @@ pub fn oauth_parse_callback(
         user_id,
         user_name,
         avatar,
-        // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一台
+        // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一套
         //（与 AuthCode 交换共用入口选定值，防分钟级交换窗口内两处漂移）
         device_id: Some(fallback_device),
+        machine_id: (!fallback_machine.is_empty()).then_some(fallback_machine),
     })
 }
 
@@ -861,13 +915,15 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
                     "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
                     "DeviceType": "PC",
                     "DeviceName": "",
-                    "DeviceModel": "",
+                    // 与推理/模型同步共用同一份设备指纹（trae_identity::profile），
+                    // 真实客户端此五字段非空，留空本身即反常
+                    "DeviceModel": crate::trae_identity::device_model(),
                     "ClientVersion": cred.app_version,
                     "DevicePublicKey": pub_pem,
-                    "DeviceBrand": "",
-                    "DeviceCPU": "",
-                    "OSInfo": "",
-                    "OSVersion": "",
+                    "DeviceBrand": crate::trae_identity::device_manufacturer(),
+                    "DeviceCPU": crate::trae_identity::cpu(),
+                    "OSInfo": crate::trae_identity::os_name(),
+                    "OSVersion": crate::trae_identity::os_version(),
                 },
                 "IDEVersion": cred.app_version,
             }),
@@ -1491,24 +1547,32 @@ fn try_refresh_variant(
 
 /// GetUserInfo：获取用户信息
 fn get_user_info(access_token: &str) -> Result<(String, String), String> {
-    let auth = if access_token.starts_with("Cloud-IDE-JWT ") {
-        access_token.to_string()
-    } else {
-        format!("Cloud-IDE-JWT {}", access_token)
-    };
+    // 真实 Trae CN：GetUserInfo 走 api.trae.cn + x-cloudide-token（裸 JWT），
+    // body 必须带 ReqSource/IDEVersion；历史上用 authorization 头 + 空 body 是旧形态
+    let token = access_token
+        .strip_prefix("Cloud-IDE-JWT ")
+        .unwrap_or(access_token)
+        .trim();
 
     let resp = exchange_agent()?
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
-        .set("authorization", &auth)
+        .post("https://api.trae.cn/cloudide/api/v3/trae/GetUserInfo")
+        .set("x-cloudide-token", token)
         .set("content-type", "application/json")
         .set("accept", "*/*")
-        .send_json(ureq::json!({}))
+        .send_json(ureq::json!({
+            "ReqSource": crate::trae_identity::req_source(),
+            "IDEVersion": crate::trae_identity::app_version(),
+        }))
         .map_err(|e| format!("GetUserInfo 请求失败: {}", e))?;
 
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let data = body.get("data").or(body.get("result")).ok_or("响应中缺少 data 字段")?;
+    let data = body
+        .get("data")
+        .or_else(|| body.get("result"))
+        .or_else(|| body.get("Result"))
+        .ok_or("响应中缺少 data 字段")?;
 
     let user_id = data
         .get("user_id")
@@ -1523,6 +1587,7 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
         .or_else(|| data.get("user_name"))
         .or_else(|| data.get("userName"))
         .or_else(|| data.get("nickname"))
+        .or_else(|| data.get("ScreenName"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -1530,28 +1595,27 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
     Ok((user_id, user_name))
 }
 
-/// 登录 URL 设备品牌参数（x_device_brand，对齐真实客户端 telemetry 命名）：
-/// Windows 读 COMPUTERNAME；非 Windows（docker/Linux 部署）回退 HOSTNAME 或
-/// /etc/hostname，最终兜底 Windows-PC——URL 其余参数本就伪装 Windows 客户端
-///（x_device_type=windows 等），兜底保持同一伪装口径
-fn login_page_hostname() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("HOSTNAME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string("/etc/hostname")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_else(|| "Windows-PC".into())
-    }
+/// 生成 UUID v4 形态字符串（真实客户端 login_trace_id 取 randomUUID()）：
+/// 32 位十六进制按 8-4-4-4-12 分组，第 13 位固定 "4"（版本位），
+/// 第 17 位取 8/9/a/b（RFC 4122 variant 位）
+fn uuid_v4() -> String {
+    let h = random_hex(32);
+    let b = h.as_bytes();
+    let variant = match b[16] {
+        b'0'..=b'3' => '8',
+        b'4'..=b'7' => '9',
+        b'8'..=b'b' => 'a',
+        _ => 'b',
+    };
+    format!(
+        "{}-{}-4{}-{}{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        variant,
+        &h[17..20],
+        &h[20..32]
+    )
 }
 
 /// 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中（B3 移植）
@@ -1593,6 +1657,16 @@ pub fn oauth_login(
         .device_id
         .clone()
         .unwrap_or_else(|| select_login_device(state).0);
+    // 机器码与设备同源：回调未透传时按同一凭证回查（真实凭证/合成凭证均可命中）
+    let login_machine_id = callback_info
+        .machine_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            find_cred_by_device(state, &login_device_id)
+                .map(|c| c.machine_id)
+                .unwrap_or_default()
+        });
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
     // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
@@ -1696,7 +1770,7 @@ pub fn oauth_login(
     // 4.5 issue #76 次因修复：新 JWT 绑定本次登录设备，立即回写 device_map——
     // 签到/积分查询经 get_device_for/resolve_device 取该设备，x-device-id 与 JWT
     // 同源（此前不回写，签到路径派生另一台伪设备，新 JWT 严格校验指纹时被拒）
-    writeback_oauth_device(state, &user_id, &login_device_id);
+    writeback_oauth_device(state, &user_id, &login_device_id, &login_machine_id);
     // Web-only 每登录会话合成身份：成功拿到 uid 后落为该账号身份，供后续刷新
     // DeviceProof 使用。删除账号时同步移除，重新 OAuth 即生成新设备。
     if let Some(cred) = take_pending_login_device(state, &login_device_id) {
@@ -1834,6 +1908,28 @@ pub fn oauth_login(
 mod oauth_tests {
     use super::*;
 
+    /// login_trace_id 形态回归：真实客户端取 randomUUID()，8-4-4-4-12 且版本位为 4、
+    /// variant 位为 8/9/a/b；裸 32 hex 与真实客户端不一致，属可识别指纹差异
+    #[test]
+    fn uuid_v4_has_rfc4122_shape() {
+        for _ in 0..32 {
+            let s = uuid_v4();
+            assert_eq!(s.len(), 36, "UUID 长度应为 36：{s}");
+            let parts: Vec<&str> = s.split('-').collect();
+            let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+            assert_eq!(lens, vec![8, 4, 4, 4, 12], "分组应为 8-4-4-4-12：{s}");
+            assert_eq!(&parts[2][..1], "4", "版本位应为 4：{s}");
+            assert!(
+                matches!(&parts[3][..1], "8" | "9" | "a" | "b"),
+                "variant 位应为 8/9/a/b：{s}"
+            );
+            assert!(
+                s.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+                "只应含十六进制与连字符：{s}"
+            );
+        }
+    }
+
     /// 定级回归（2026-10-06 缺陷）：app.log 实测响应形态必须被识别为 code=20101，
     /// 且判为「服务端明确拒绝」——旧实现对同一响应恒判「无 Error 信封」，
     /// 失效凭证被记成「网络类不计失效」，永不置 refresh_token_invalid。
@@ -1916,6 +2012,7 @@ mod oauth_tests {
             device_id: device_id.to_string(),
             market_user_id: None,
             session_id: None,
+            machine_id: None,
         }
     }
 

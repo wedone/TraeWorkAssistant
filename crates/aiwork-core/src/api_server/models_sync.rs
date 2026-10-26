@@ -101,7 +101,7 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     match model_lower {
         "doubao-seed-code" | "glm-5.3-flash" | "qwen3.8-flash" | "deepseek-v4.1-flash"
         | "kimi-k2.8-preview" => "solo_agent",
-        _ => super::FUNCTION,
+        _ => super::default_function(),
     }
 }
 
@@ -247,11 +247,21 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         .take(3)
         .filter_map(|a| {
             let uid = a.user_id.as_deref()?.to_string();
-            let device_id = device_map
-                .get(&uid)
+            let entry = device_map.get(&uid);
+            // 绝不发送空 x-device-id：无 device_map 条目时优先回落实机环境档案的
+            // 全局设备，其次派生设备（与推理侧同源）
+            let imported = crate::trae_identity::imported_login_device();
+            let device_id = entry
                 .map(|d| d.device_id.clone())
-                .unwrap_or_default();
-            let machine_id = super::pool::seeded_hex(64, &uid, "mach");
+                .filter(|s| !s.is_empty())
+                .or_else(|| imported.as_ref().map(|(d, _)| d.clone()))
+                .unwrap_or_else(|| crate::commands::accounts::derive_device(&uid).device_id);
+            // machine_id 与登录/推理同源：优先 device_map 回写值，其次实机档案，缺省按 uid 派生
+            let machine_id = entry
+                .and_then(|d| d.machine_id.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| imported.map(|(_, m)| m))
+                .unwrap_or_else(|| super::pool::seeded_hex(64, &uid, "mach"));
             Some((a, device_id, machine_id))
         })
         .collect();
@@ -292,6 +302,10 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         // 时的 strip_prefix 行为。
         let jwt_raw = account.jwt.trim();
         let jwt_clean = jwt_raw.strip_prefix("Cloud-IDE-JWT ").unwrap_or(jwt_raw).trim();
+        // T4：版本身份与推理请求同源（实例级唯一身份，不按账号分流）
+        let ide_ver = super::ide_version();
+        let ide_ver_code = super::ide_version_code();
+        let app_ver_code = super::app_version_code();
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
@@ -299,24 +313,24 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("User-Agent", "TraeClient/TTNet")
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", "default")
-            .set("x-app-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-app-version-code", app_ver_code)
             .set("x-bridge-transport", "aha")
-            .set("x-device-brand", "CREFG-XX")
-            .set("x-device-cpu", "Intel")
+            .set("x-device-brand", crate::trae_identity::device_model())
+            .set("x-device-cpu", crate::trae_identity::cpu())
             .set("x-device-id", device_id)
-            .set("x-device-type", "windows")
+            .set("x-device-type", crate::trae_identity::os_name())
             .set("x-ide-token", jwt_clean)
-            .set("x-ide-version", &super::IDE_VERSION)
-            .set("x-ide-version-code", &super::IDE_VERSION_CODE.to_string())
+            .set("x-ide-version", ide_ver)
+            .set("x-ide-version-code", ide_ver_code)
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
-            .set("x-os-version", "Windows 11 Home China")
-            .set("package-type", "stable_cn")
-            .set("x-lscbd-aid", "787976")
+            .set("x-os-version", crate::trae_identity::os_version())
+            .set("package-type", super::package_type())
+            .set("x-lscbd-aid", crate::trae_identity::app_id())
             .set("x-lscbd-platform", "windows")
-            .set("app-version", &super::IDE_VERSION)
-            .set("x-ss-dp", "787976")
+            .set("app-version", ide_ver)
+            .set("x-ss-dp", crate::trae_identity::app_id())
             .send_json(body.clone());
 
         match resp {
@@ -609,8 +623,8 @@ mod tests {
         assert_eq!(function_for_model("doubao-seed-code"), "solo_agent");
         assert_eq!(function_for_model("deepseek-v4.1-flash"), "solo_agent");
         assert_eq!(function_for_model("kimi-k2.8-preview"), "solo_agent");
-        assert_eq!(function_for_model("glm-5.2"), super::super::FUNCTION);
-        assert_eq!(function_for_model("deepseek-v4-flash"), super::super::FUNCTION);
+        assert_eq!(function_for_model("glm-5.2"), super::super::default_function());
+        assert_eq!(function_for_model("deepseek-v4-flash"), super::super::default_function());
     }
 
     /// 查表优先：表内 function 非空则直接采用（官方新上架免改代码），
@@ -650,10 +664,10 @@ mod tests {
         assert_eq!(function_for_model_in(&list, "deepseek-v4.1-flash"), "solo_agent");
         // 表外已知模型 → 硬编码；表外未知模型 → 默认 function
         assert_eq!(function_for_model_in(&list, "glm-5.3-flash"), "solo_agent");
-        assert_eq!(function_for_model_in(&list, "glm-5.2"), super::super::FUNCTION);
-        assert_eq!(function_for_model_in(&list, "totally-unknown"), super::super::FUNCTION);
+        assert_eq!(function_for_model_in(&list, "glm-5.2"), super::super::default_function());
+        assert_eq!(function_for_model_in(&list, "totally-unknown"), super::super::default_function());
         // 空表 → 全部硬编码回退
-        assert_eq!(function_for_model_in(&[], "brand-new-model"), super::super::FUNCTION);
+        assert_eq!(function_for_model_in(&[], "brand-new-model"), super::super::default_function());
     }
 
     /// 历史数据兼容：无 function 的存量条目按硬编码实测映射回填（与旧路由
@@ -677,7 +691,7 @@ mod tests {
         ];
         let (upgraded, changed) = backfill_functions(legacy);
         assert!(changed);
-        assert_eq!(upgraded[0].function, super::super::FUNCTION);
+        assert_eq!(upgraded[0].function, super::super::default_function());
         // 官方原样大小写 id（Doubao-Seed-Code）按小写命中硬编码映射
         assert_eq!(upgraded[1].function, "solo_agent");
         assert_eq!(upgraded[2].function, "solo_agent");
@@ -707,7 +721,7 @@ mod tests {
         };
         assert_eq!(f("deepseek-v4.1-flash"), "solo_agent");
         assert_eq!(f("kimi-k2.8-preview"), "solo_agent");
-        assert_eq!(f("glm-5.2"), super::super::FUNCTION);
+        assert_eq!(f("glm-5.2"), super::super::default_function());
     }
 
     #[test]

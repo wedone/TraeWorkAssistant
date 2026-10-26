@@ -124,6 +124,10 @@ pub struct DeviceEntry {
     pub market_user_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 设备机器码（真实客户端 telemetry.machineId，64 hex）：登录/刷新时随设备一起
+    /// 落库，推理与模型同步取同一值，避免同一账号在登录与调用阶段自报不同 machine_id
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
 
 pub type DeviceMap = HashMap<String, DeviceEntry>;
@@ -548,6 +552,13 @@ pub struct ApiPoolFile {
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
+    /// Trae 池客户端线身份（实例级，取代原 trae_ide_gray/trae_function_gray）：
+    /// false = Trae CN IDE 真实身份（3.4.4 / 344 / solo_agent），
+    /// true = 沿用旧 SOLO 线身份（0.1.50 / 20260811 / solo_work_lite）。
+    /// 进程级唯一开关——同一实例不会同时存在两种版本身份；旧按 uid 哈希分流会让
+    /// 同一台机器对不同账号声称不同客户端版本，本身即风控信号，故废弃。
+    #[serde(default)]
+    pub trae_ide_legacy: bool,
     /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
     #[serde(default)]
     pub wb_default_thinking: bool,
@@ -726,6 +737,7 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             group_ids: Vec::new(),
             wb_enabled: false,
+            trae_ide_legacy: false,
             wb_default_thinking: false,
             wb_tool_exec: false,
             wb_bg_downgrade: false,

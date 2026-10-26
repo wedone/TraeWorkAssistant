@@ -142,8 +142,9 @@ pub fn device_credential_from_json(v: &serde_json::Value) -> Option<DeviceCreden
 }
 
 /// 生成合成设备凭证（容器/无 Trae 客户端环境的兜底身份）：随机 EC P-256 密钥对
-/// + 15 位数字 deviceId + 32 hex machineId——与全新安装 IDE 的自生成身份等价
-///（IDE 首启同样本地生成密钥对并经 DeviceInfo.DevicePublicKey 自声明，无预注册 API）。
+/// + 15 位数字 deviceId（与签到派生体系逐位一致）+ 64 hex machineId（对齐真实
+/// `telemetry.machineId` 形态）——IDE 首启同样本地生成密钥对并经
+/// DeviceInfo.DevicePublicKey 自声明，无预注册 API。
 /// 私钥由调用方持久化（服务端自有身份，与 store 内 token 同信任域；不进日志）。
 pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceCredential, String> {
     use p256::pkcs8::EncodePrivateKey;
@@ -163,7 +164,7 @@ pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceC
     Ok(DeviceCredential {
         device_id,
         private_key_pem: pem.to_string(),
-        machine_id: random_hex(32),
+        machine_id: random_hex(64),
         app_version: app_version.to_string(),
         source_app: "synthetic".to_string(),
     })
@@ -192,20 +193,26 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
             continue;
         };
         let Some(obj) = v.as_object() else { continue };
-        // DeviceInfo.ClientVersion 用：安装目录 package.json 的 version（真实客户端
-        // 上报的是 appVersion，与服务端对设备注册记录的校验相关）
-        let app_version = std::fs::read_to_string(
-            std::path::PathBuf::from(&localappdata)
-                .join("Programs")
-                .join(app)
-                .join("resources")
-                .join("app")
-                .join("package.json"),
-        )
-        .ok()
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
-        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
-        .unwrap_or_default();
+        // DeviceInfo.ClientVersion 用真实客户端上报的 appVersion（product.json），
+        // 不能用 resources/app/package.json.version——那是 VS Code 基座版本（1.107.1），
+        // 与真实 DeviceInfo.ClientVersion（Trae CN 3.4.4）不一致。package.json 仅作兜底。
+        let app_dir = std::path::PathBuf::from(&localappdata)
+            .join("Programs")
+            .join(app)
+            .join("resources")
+            .join("app");
+        let app_version = std::fs::read_to_string(app_dir.join("product.json"))
+            .ok()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+            .and_then(|p| p.get("appVersion").and_then(|x| x.as_str()).map(String::from))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(app_dir.join("package.json"))
+                    .ok()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                    .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
+            })
+            .unwrap_or_default();
         let machine_id = obj
             .get("telemetry.machineId")
             .and_then(|x| x.as_str())

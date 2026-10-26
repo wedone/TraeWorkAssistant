@@ -253,6 +253,24 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     );
     wb_pool.set_strategy(wb_strategy);
 
+    // T3/T5：Trae 池客户端线身份（实例级唯一：false=IDE 真实身份，true=旧 SOLO 线）
+    super::set_trae_ide_legacy(pool_file.trae_ide_legacy);
+    // 实机环境档案（UI 导入）在进程启动时热应用，覆盖内置/本机扫描身份
+    crate::commands::client_profile::apply_persisted(&state.data_dir);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-Trae 身份: line={} version={}/{} function={} \
+(legacy 对照组 {}/{})",
+            if pool_file.trae_ide_legacy { "legacy" } else { "ide" },
+            super::ide_version(),
+            super::ide_version_code(),
+            super::default_function(),
+            super::LEGACY_IDE_VERSION,
+            super::LEGACY_IDE_VERSION_CODE,
+        ),
+    );
+
     // Qoder 池启动概况（p3-3 + 池内策略）：qoder_strategy 空 = 跟随 Trae 池策略
     //（与 Buddy 池 resolve_wb 同语义）
     let qoder_strategy =
@@ -611,6 +629,8 @@ pub fn apply_pool_snapshot(
     let accounts = crate::vault::load_accounts(state);
     // 走迁移入口（防止直读落 serde default 后整表写回静默覆盖迁移值）
     let pool_file: ApiPoolFile = load_pool_file(&state.data_dir);
+    // T3/T5 客户端线身份随配置刷新（同步池与启动路径共用，幂等）
+    crate::api_server::set_trae_ide_legacy(pool_file.trae_ide_legacy);
     let groups_file: GroupsFile = store::docs::groups_load(&store::db(&state.data_dir));
     let cooldowns_file: AccountCooldownsFile =
         store::docs::account_cooldowns_load(&store::db(&state.data_dir));

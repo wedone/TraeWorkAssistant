@@ -1384,3 +1384,32 @@ export interface SanitizeMapView {
   updated_at: number | null;
   builtin?: boolean;
 }
+
+// ---- 实机环境档案（client_profile_import；真机 JSON → 网关全局身份）----
+// imported=false 时 profile 为当前生效的内置/本机扫描值，便于前端对照
+export interface ClientProfileView {
+  imported: boolean;
+  profile: {
+    app_version: string;
+    build_version: string;
+    version_code: string;
+    /** IDE 侧版本码（x-ide-version-code），真机实证 20260212，与 version_code 不同口径 */
+    ide_version_code: string;
+    package_type: string;
+    app_id: string;
+    os_name: string;
+    os_version: string;
+    device_model: string;
+    device_manufacturer: string;
+    cpu: string;
+    /** 已导入时才有值；未导入为空串 */
+    device_id: string;
+    machine_id: string;
+  };
+  /** 已导入档案的 device_id（未导入为空串） */
+  device_id: string;
+  /** 已导入档案的 machine_id（未导入为空串） */
+  machine_id: string;
+  /** 是否已随档案导入真机 icube 私钥（DeviceInfo/DeviceProof 用） */
+  has_private_key: boolean;
+}
