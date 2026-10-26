@@ -20,7 +20,8 @@ import type { ClientProfileView } from '../../types';
 const ROWS: { key: keyof ClientProfileView['profile']; label: string }[] = [
   { key: 'app_version', label: '客户端版本' },
   { key: 'build_version', label: '构建号' },
-  { key: 'version_code', label: '版本号 code' },
+  { key: 'version_code', label: 'TTNet 版本码' },
+  { key: 'ide_version_code', label: 'IDE 版本码' },
   { key: 'package_type', label: '包类型' },
   { key: 'app_id', label: 'appId' },
   { key: 'os_name', label: '系统名' },

@@ -3056,6 +3056,7 @@ fn make_upstream_request(
     // T3：版本身份实例级唯一（请求头与请求体必须同源，见 payload 同款调用）
     let ide_ver = super::ide_version();
     let ide_ver_code = super::ide_version_code();
+    let app_ver_code = super::app_version_code();
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -3074,7 +3075,7 @@ fn make_upstream_request(
         .set("x-ide-token", jwt)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
-        .set("x-app-version-code", ide_ver_code)
+        .set("x-app-version-code", app_ver_code)
         .set("x-ide-version", ide_ver)
         .set("x-ide-version-code", ide_ver_code)
         .set("x-ide-version-type", "stable")

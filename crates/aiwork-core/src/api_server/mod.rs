@@ -56,7 +56,18 @@ pub fn ide_version() -> &'static str {
         crate::trae_identity::app_version()
     }
 }
+/// IDE 侧版本码（x-ide-version-code）：2026-10-26 本机 ai-completion 日志实证值
+/// `20260212`，取自客户端内置 domain config；与 TTNet 的 `344` 不是同一口径。
 pub fn ide_version_code() -> &'static str {
+    if trae_ide_legacy() {
+        LEGACY_IDE_VERSION_CODE
+    } else {
+        crate::trae_identity::ide_version_code()
+    }
+}
+/// TTNet 侧版本码（x-app-version-code / app-version-code）：manifest
+/// ahaNet.ttnet_params.version_code，如 "344"
+pub fn app_version_code() -> &'static str {
     if trae_ide_legacy() {
         LEGACY_IDE_VERSION_CODE
     } else {

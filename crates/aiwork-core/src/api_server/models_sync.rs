@@ -305,6 +305,7 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         // T4：版本身份与推理请求同源（实例级唯一身份，不按账号分流）
         let ide_ver = super::ide_version();
         let ide_ver_code = super::ide_version_code();
+        let app_ver_code = super::app_version_code();
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
@@ -312,7 +313,7 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("User-Agent", "TraeClient/TTNet")
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", "default")
-            .set("x-app-version-code", ide_ver_code)
+            .set("x-app-version-code", app_ver_code)
             .set("x-bridge-transport", "aha")
             .set("x-device-brand", crate::trae_identity::device_model())
             .set("x-device-cpu", crate::trae_identity::cpu())

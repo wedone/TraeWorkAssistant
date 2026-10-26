@@ -12,7 +12,12 @@ use std::sync::{OnceLock, RwLock};
 /// 内置兜底：本机 Trae CN IDE 实测值（2026-10-25 取证）
 const DEFAULT_APP_VERSION: &str = "3.4.4";
 const DEFAULT_BUILD_VERSION: &str = "2.3.93438";
+/// TTNet 侧版本码（manifest.ahaNet.ttnet_params.version_code），如 "344"
 const DEFAULT_VERSION_CODE: &str = "344";
+/// IDE 侧版本码（x-ide-version-code，取自客户端内置 domain config `versionCode`）。
+/// 2026-10-26 本机 ai-completion 日志实证：`x-ide-version-code: "20260212"`；
+/// 注意它与 TTNet 的 "344"、TTNet 计算出的 "3004004" 是三个不同的口径。
+const DEFAULT_IDE_VERSION_CODE: &str = "20260212";
 const DEFAULT_PACKAGE_TYPE: &str = "stable_cn";
 const DEFAULT_APP_ID: &str = "787976";
 /// IDE 线请求来源标识（客户端 GetUserInfo 自报值）
@@ -27,6 +32,8 @@ pub struct TraeIdentity {
     pub build_version: String,
     /// 版本号（数字递增），如 "344"；注意与 SOLO 线的日期格式不同
     pub version_code: String,
+    /// IDE 侧版本码（x-ide-version-code），如 "20260212"
+    pub ide_version_code: String,
     /// 包类型，如 "stable_cn"
     pub package_type: String,
     /// 客户端 appId，如 "787976"
@@ -57,6 +64,9 @@ pub struct ImportedProfile {
     pub build_version: String,
     #[serde(default)]
     pub version_code: String,
+    /// IDE 侧版本码（x-ide-version-code）；导出档案未带时沿用内置实证值
+    #[serde(default)]
+    pub ide_version_code: String,
     #[serde(default)]
     pub package_type: String,
     #[serde(default)]
@@ -153,6 +163,14 @@ pub fn req_source() -> &'static str {
     &identity().req_source
 }
 
+/// IDE 侧版本码（x-ide-version-code），如 "20260212"
+pub fn ide_version_code() -> &'static str {
+    match imported() {
+        Some(p) if !p.ide_version_code.is_empty() => &p.ide_version_code,
+        _ => &identity().ide_version_code,
+    }
+}
+
 fn resolve() -> TraeIdentity {
     let local = read_local_manifest();
     let source = if local.is_some() {
@@ -164,11 +182,14 @@ fn resolve() -> TraeIdentity {
         app_version: DEFAULT_APP_VERSION.into(),
         build_version: DEFAULT_BUILD_VERSION.into(),
         version_code: DEFAULT_VERSION_CODE.into(),
+        ide_version_code: DEFAULT_IDE_VERSION_CODE.into(),
         package_type: DEFAULT_PACKAGE_TYPE.into(),
         app_id: DEFAULT_APP_ID.into(),
         req_source: DEFAULT_REQ_SOURCE.into(),
         source,
     });
+    // manifest 不含 IDE 侧版本码，恒用内置实证值（可用环境变量覆盖）
+    id.ide_version_code = DEFAULT_IDE_VERSION_CODE.into();
     // 环境变量逐字段覆盖（上游更换版本时无需发版）
     if let Some(v) = env_nonempty("TRAE_APP_VERSION") {
         id.app_version = v;
@@ -180,6 +201,10 @@ fn resolve() -> TraeIdentity {
     }
     if let Some(v) = env_nonempty("TRAE_VERSION_CODE") {
         id.version_code = v;
+        id.source = "env";
+    }
+    if let Some(v) = env_nonempty("TRAE_IDE_VERSION_CODE") {
+        id.ide_version_code = v;
         id.source = "env";
     }
     if let Some(v) = env_nonempty("TRAE_PACKAGE_TYPE") {
@@ -240,6 +265,7 @@ fn read_local_manifest() -> Option<TraeIdentity> {
             app_version: app_version.to_string(),
             build_version: build_version.to_string(),
             version_code: version_code.to_string(),
+            ide_version_code: DEFAULT_IDE_VERSION_CODE.to_string(),
             package_type: package_type.to_string(),
             app_id: v["appId"]
                 .as_str()
@@ -362,6 +388,13 @@ mod tests {
             id.version_code.chars().all(|c| c.is_ascii_digit()),
             "version_code 应为纯数字，实际 {}",
             id.version_code
+        );
+        // IDE 侧版本码与 TTNet 版本码是两个口径，同样必须非空且纯数字
+        assert!(!id.ide_version_code.is_empty());
+        assert!(
+            id.ide_version_code.chars().all(|c| c.is_ascii_digit()),
+            "ide_version_code 应为纯数字，实际 {}",
+            id.ide_version_code
         );
     }
 

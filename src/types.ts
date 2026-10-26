@@ -1393,6 +1393,8 @@ export interface ClientProfileView {
     app_version: string;
     build_version: string;
     version_code: string;
+    /** IDE 侧版本码（x-ide-version-code），真机实证 20260212，与 version_code 不同口径 */
+    ide_version_code: string;
     package_type: string;
     app_id: string;
     os_name: string;

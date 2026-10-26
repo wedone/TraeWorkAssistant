@@ -235,6 +235,7 @@ pub fn client_profile_get(state: &AppState) -> ProfileView {
             app_version: crate::trae_identity::app_version().to_string(),
             build_version: crate::trae_identity::build_version().to_string(),
             version_code: crate::trae_identity::version_code().to_string(),
+            ide_version_code: crate::trae_identity::ide_version_code().to_string(),
             package_type: crate::trae_identity::package_type().to_string(),
             app_id: crate::trae_identity::app_id().to_string(),
             os_name: crate::trae_identity::os_name().to_string(),
