@@ -3048,14 +3048,14 @@ fn upstream_header_digest(r: &ureq::Response, sent_trace: &str, sent_req_id: &st
 
 fn make_upstream_request(
     jwt: &str,
-    uid: &str,
+    _uid: &str,
     device_id: &str,
     machine_id: &str,
     body: &[u8],
 ) -> Result<(Box<dyn Read + Send>, String), (u16, String, Option<u64>)> {
-    // T3：版本身份按 uid 灰度分流（请求头与请求体必须同源，见 payload 同款调用）
-    let ide_ver = super::ide_version_for(uid);
-    let ide_ver_code = super::ide_version_code_for(uid);
+    // T3：版本身份实例级唯一（请求头与请求体必须同源，见 payload 同款调用）
+    let ide_ver = super::ide_version();
+    let ide_ver_code = super::ide_version_code();
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(

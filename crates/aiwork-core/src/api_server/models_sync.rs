@@ -101,7 +101,7 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     match model_lower {
         "doubao-seed-code" | "glm-5.3-flash" | "qwen3.8-flash" | "deepseek-v4.1-flash"
         | "kimi-k2.8-preview" => "solo_agent",
-        _ => super::FUNCTION,
+        _ => super::default_function(),
     }
 }
 
@@ -298,10 +298,9 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         // 时的 strip_prefix 行为。
         let jwt_raw = account.jwt.trim();
         let jwt_clean = jwt_raw.strip_prefix("Cloud-IDE-JWT ").unwrap_or(jwt_raw).trim();
-        // T4：版本身份与推理请求同源（按账号 uid 灰度分流，避免同步/推理两套身份并存）
-        let uid = account.user_id.as_deref().unwrap_or("");
-        let ide_ver = super::ide_version_for(uid);
-        let ide_ver_code = super::ide_version_code_for(uid);
+        // T4：版本身份与推理请求同源（实例级唯一身份，不按账号分流）
+        let ide_ver = super::ide_version();
+        let ide_ver_code = super::ide_version_code();
         let resp = agent
             .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
@@ -619,8 +618,8 @@ mod tests {
         assert_eq!(function_for_model("doubao-seed-code"), "solo_agent");
         assert_eq!(function_for_model("deepseek-v4.1-flash"), "solo_agent");
         assert_eq!(function_for_model("kimi-k2.8-preview"), "solo_agent");
-        assert_eq!(function_for_model("glm-5.2"), super::super::FUNCTION);
-        assert_eq!(function_for_model("deepseek-v4-flash"), super::super::FUNCTION);
+        assert_eq!(function_for_model("glm-5.2"), super::super::default_function());
+        assert_eq!(function_for_model("deepseek-v4-flash"), super::super::default_function());
     }
 
     /// 查表优先：表内 function 非空则直接采用（官方新上架免改代码），
@@ -660,10 +659,10 @@ mod tests {
         assert_eq!(function_for_model_in(&list, "deepseek-v4.1-flash"), "solo_agent");
         // 表外已知模型 → 硬编码；表外未知模型 → 默认 function
         assert_eq!(function_for_model_in(&list, "glm-5.3-flash"), "solo_agent");
-        assert_eq!(function_for_model_in(&list, "glm-5.2"), super::super::FUNCTION);
-        assert_eq!(function_for_model_in(&list, "totally-unknown"), super::super::FUNCTION);
+        assert_eq!(function_for_model_in(&list, "glm-5.2"), super::super::default_function());
+        assert_eq!(function_for_model_in(&list, "totally-unknown"), super::super::default_function());
         // 空表 → 全部硬编码回退
-        assert_eq!(function_for_model_in(&[], "brand-new-model"), super::super::FUNCTION);
+        assert_eq!(function_for_model_in(&[], "brand-new-model"), super::super::default_function());
     }
 
     /// 历史数据兼容：无 function 的存量条目按硬编码实测映射回填（与旧路由
@@ -687,7 +686,7 @@ mod tests {
         ];
         let (upgraded, changed) = backfill_functions(legacy);
         assert!(changed);
-        assert_eq!(upgraded[0].function, super::super::FUNCTION);
+        assert_eq!(upgraded[0].function, super::super::default_function());
         // 官方原样大小写 id（Doubao-Seed-Code）按小写命中硬编码映射
         assert_eq!(upgraded[1].function, "solo_agent");
         assert_eq!(upgraded[2].function, "solo_agent");
@@ -717,7 +716,7 @@ mod tests {
         };
         assert_eq!(f("deepseek-v4.1-flash"), "solo_agent");
         assert_eq!(f("kimi-k2.8-preview"), "solo_agent");
-        assert_eq!(f("glm-5.2"), super::super::FUNCTION);
+        assert_eq!(f("glm-5.2"), super::super::default_function());
     }
 
     #[test]
