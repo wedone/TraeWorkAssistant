@@ -374,14 +374,19 @@ impl ApiPool {
                 //   "x-device-id: ''" 是显性指纹异常，容易在上游形成聚集特征触发影子风控。
                 // - machine_id 优先取 device_map 中与 device_id 同源落库的值（OAuth 登录时写入的
                 //   真实/合成凭证 machineId）；缺省时按 uid 派生兜底。登录与调用必须同一 machine_id。
+                // - 实机环境档案（UI 导入）存在时，无 device_map 条目的账号统一回落该全局设备，
+                //   与登录 URL 声明保持一致（已有绑定不动，避免 Token device 不匹配）
                 let entry = device_map.get(uid);
+                let imported = crate::trae_identity::imported_login_device();
                 let device_id = entry
                     .map(|d| d.device_id.clone())
                     .filter(|s| !s.is_empty())
+                    .or_else(|| imported.as_ref().map(|(d, _)| d.clone()))
                     .unwrap_or_else(|| crate::commands::accounts::derive_device(uid).device_id);
                 let machine_id = entry
                     .and_then(|d| d.machine_id.clone())
                     .filter(|s| !s.is_empty())
+                    .or_else(|| imported.map(|(_, m)| m))
                     .unwrap_or_else(|| seeded_hex(64, uid, "mach"));
                 let jwt_raw = a.jwt.clone();
                 let jwt_clean = jwt_raw

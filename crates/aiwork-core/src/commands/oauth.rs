@@ -340,6 +340,12 @@ fn find_cred_by_device(
     device_id: &str,
 ) -> Option<crate::icube_auth::DeviceCredential> {
     let store = crate::store::db(&state.data_dir);
+    // 实机环境档案（UI 导入）的凭证优先：它与授权 URL 声明的 device_id 同源
+    if let Some(cred) = crate::commands::client_profile::imported_credential(&state.data_dir)
+        .filter(|c| c.device_id == device_id)
+    {
+        return Some(cred);
+    }
     // OAuth 登录窗口内，pending synthetic 身份尚未绑定 uid（uid 要等 JWT 解析后才
     // 可知），必须先按 pending 设备 ID 直接命中，供 AuthCode/DeviceInfo 交换使用。
     let pending: serde_json::Value = store.kv_get(&format!("{}pending", SYNTHETIC_DEVICE_KEY_PREFIX));
@@ -409,6 +415,10 @@ fn select_credential_index(
 /// .MachineID 同源，对齐真实客户端 URL 参数 = telemetry.machineId）；
 /// Web-only 无本机凭证时为本次登录生成 synthetic 身份
 fn select_login_device(state: &AppState) -> (String, String) {
+    // 实机环境档案（UI 导入）：全局唯一设备优先，保证新登录与真机一致
+    if let Some((device_id, machine_id)) = crate::trae_identity::imported_login_device() {
+        return (device_id, machine_id);
+    }
     let creds = icube_device_creds(&state.data_dir);
     if !creds.is_empty() {
         let store = crate::store::db(&state.data_dir);

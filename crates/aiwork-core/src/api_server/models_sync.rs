@@ -248,15 +248,19 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         .filter_map(|a| {
             let uid = a.user_id.as_deref()?.to_string();
             let entry = device_map.get(&uid);
-            // 绝不发送空 x-device-id：无 device_map 条目时回落派生设备（与推理侧同源）
+            // 绝不发送空 x-device-id：无 device_map 条目时优先回落实机环境档案的
+            // 全局设备，其次派生设备（与推理侧同源）
+            let imported = crate::trae_identity::imported_login_device();
             let device_id = entry
                 .map(|d| d.device_id.clone())
                 .filter(|s| !s.is_empty())
+                .or_else(|| imported.as_ref().map(|(d, _)| d.clone()))
                 .unwrap_or_else(|| crate::commands::accounts::derive_device(&uid).device_id);
-            // machine_id 与登录/推理同源：优先 device_map 回写值，缺省按 uid 派生兜底
+            // machine_id 与登录/推理同源：优先 device_map 回写值，其次实机档案，缺省按 uid 派生
             let machine_id = entry
                 .and_then(|d| d.machine_id.clone())
                 .filter(|s| !s.is_empty())
+                .or_else(|| imported.map(|(_, m)| m))
                 .unwrap_or_else(|| super::pool::seeded_hex(64, &uid, "mach"));
             Some((a, device_id, machine_id))
         })

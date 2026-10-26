@@ -255,6 +255,8 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
 
     // T3/T5：Trae 池客户端线身份（实例级唯一：false=IDE 真实身份，true=旧 SOLO 线）
     super::set_trae_ide_legacy(pool_file.trae_ide_legacy);
+    // 实机环境档案（UI 导入）在进程启动时热应用，覆盖内置/本机扫描身份
+    crate::commands::client_profile::apply_persisted(&state.data_dir);
     fs_utils::app_log(
         &state.data_dir,
         &format!(

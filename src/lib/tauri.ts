@@ -16,6 +16,7 @@ import type {
   BuddyAiUsageOfficialAll,
   CheckinOpts,
   CheckinTrendPoint,
+  ClientProfileView,
   CreditDetail,
   CreditsDailySnapshot,
   CustomModel,
@@ -730,6 +731,13 @@ export const api = {
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled }),
+  },
+  // 实机环境档案（UI「实机环境」页签）：真机导出 JSON → 后端解密并全局生效
+  clientProfile: {
+    get: () => invoke<ClientProfileView>('client_profile_get'),
+    import: (content: string) =>
+      invoke<ClientProfileView>('client_profile_import', { content }),
+    clear: () => invoke<ClientProfileView>('client_profile_clear'),
   },
   // ---- WB 手工路由配置（wb_route_config / wb_template_map）----
   wbConfig: {

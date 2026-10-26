@@ -7,7 +7,7 @@
 //! 兜底值取自本机 Trae CN IDE 3.4.4 实测（manifest.json + main.log），
 //! 不是猜测值；本机升级后重启进程即自动跟随，无需改代码。
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// 内置兜底：本机 Trae CN IDE 实测值（2026-10-25 取证）
 const DEFAULT_APP_VERSION: &str = "3.4.4";
@@ -44,29 +44,108 @@ pub fn identity() -> &'static TraeIdentity {
     IDENTITY.get_or_init(resolve)
 }
 
+/// 实机环境导入档案（UI「实机环境」页签导入，进程级生效）。
+///
+/// 用途：网关部署在无法安装 Trae 客户端的机器（如 Debian）时，用真机导出的
+/// 档案覆盖内置/本机扫描值，使登录、推理、模型同步声称的身份与真机一致。
+/// 字段为空表示该项不覆盖，继续走内置解析值。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ImportedProfile {
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub build_version: String,
+    #[serde(default)]
+    pub version_code: String,
+    #[serde(default)]
+    pub package_type: String,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub os_name: String,
+    #[serde(default)]
+    pub os_version: String,
+    #[serde(default)]
+    pub device_model: String,
+    #[serde(default)]
+    pub device_manufacturer: String,
+    #[serde(default)]
+    pub cpu: String,
+    /// 真机 deviceId（全局唯一设备，登录优先使用）
+    #[serde(default)]
+    pub device_id: String,
+    /// 真机 machineId（telemetry.machineId）
+    #[serde(default)]
+    pub machine_id: String,
+}
+
+/// 导入档案覆盖（None = 未导入，全部走内置解析）。
+/// 存入的引用由 Box::leak 获得，进程内恒存活，故可安全返回 &'static。
+static IMPORTED: RwLock<Option<&'static ImportedProfile>> = RwLock::new(None);
+
+/// 应用实机档案（重复导入以新值覆盖旧值；旧引用随进程结束释放）
+pub fn apply_imported(profile: ImportedProfile) {
+    let leaked: &'static ImportedProfile = Box::leak(Box::new(profile));
+    *IMPORTED.write().unwrap_or_else(|e| e.into_inner()) = Some(leaked);
+}
+
+/// 清除实机档案，回退内置/本机扫描值
+pub fn clear_imported() {
+    *IMPORTED.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 当前生效的导入档案（未导入为 None）
+fn imported() -> Option<&'static ImportedProfile> {
+    *IMPORTED.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 导入档案中非空的 device_id / machine_id（全局唯一设备用）
+pub fn imported_login_device() -> Option<(String, String)> {
+    let p = imported()?;
+    if p.device_id.is_empty() || p.machine_id.is_empty() {
+        return None;
+    }
+    Some((p.device_id.clone(), p.machine_id.clone()))
+}
+
 /// 客户端版本，如 "3.4.4"
 pub fn app_version() -> &'static str {
-    &identity().app_version
+    match imported() {
+        Some(p) if !p.app_version.is_empty() => &p.app_version,
+        _ => &identity().app_version,
+    }
 }
 
 /// 构建号，如 "2.3.93438"
 pub fn build_version() -> &'static str {
-    &identity().build_version
+    match imported() {
+        Some(p) if !p.build_version.is_empty() => &p.build_version,
+        _ => &identity().build_version,
+    }
 }
 
 /// 版本号（数字递增），如 "344"
 pub fn version_code() -> &'static str {
-    &identity().version_code
+    match imported() {
+        Some(p) if !p.version_code.is_empty() => &p.version_code,
+        _ => &identity().version_code,
+    }
 }
 
 /// 包类型，如 "stable_cn"
 pub fn package_type() -> &'static str {
-    &identity().package_type
+    match imported() {
+        Some(p) if !p.package_type.is_empty() => &p.package_type,
+        _ => &identity().package_type,
+    }
 }
 
 /// 客户端 appId，如 "787976"
 pub fn app_id() -> &'static str {
-    &identity().app_id
+    match imported() {
+        Some(p) if !p.app_id.is_empty() => &p.app_id,
+        _ => &identity().app_id,
+    }
 }
 
 /// 请求来源标识，如 "IDE"
@@ -218,27 +297,42 @@ pub fn profile() -> &'static ClientProfile {
 
 /// 操作系统名（x-device-type 取值）
 pub fn os_name() -> &'static str {
-    &profile().os_name
+    match imported() {
+        Some(p) if !p.os_name.is_empty() => &p.os_name,
+        _ => &profile().os_name,
+    }
 }
 
 /// 操作系统版本（x-os-version / DeviceInfo.OSVersion 取值）
 pub fn os_version() -> &'static str {
-    &profile().os_version
+    match imported() {
+        Some(p) if !p.os_version.is_empty() => &p.os_version,
+        _ => &profile().os_version,
+    }
 }
 
 /// 设备型号（x-device-brand / DeviceInfo.DeviceModel 取值）
 pub fn device_model() -> &'static str {
-    &profile().device_model
+    match imported() {
+        Some(p) if !p.device_model.is_empty() => &p.device_model,
+        _ => &profile().device_model,
+    }
 }
 
 /// 设备厂商（DeviceInfo.DeviceBrand 取值）
 pub fn device_manufacturer() -> &'static str {
-    &profile().device_manufacturer
+    match imported() {
+        Some(p) if !p.device_manufacturer.is_empty() => &p.device_manufacturer,
+        _ => &profile().device_manufacturer,
+    }
 }
 
 /// CPU 厂商（x-device-cpu / DeviceInfo.DeviceCPU 取值）
 pub fn cpu() -> &'static str {
-    &profile().cpu
+    match imported() {
+        Some(p) if !p.cpu.is_empty() => &p.cpu,
+        _ => &profile().cpu,
+    }
 }
 
 fn resolve_profile() -> ClientProfile {

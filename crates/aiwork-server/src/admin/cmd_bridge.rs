@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use aiwork_core::commands::{
-    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, qoder,
-    shared_groups, tags, usage_history, wb_config, workbuddy,
+    accounts, api_server as api_server_cmd, checkin as checkin_cmd, client_profile, misc, oauth,
+    qoder, shared_groups, tags, usage_history, wb_config, workbuddy,
 };
 use aiwork_core::state::AppState;
 use axum::extract::{Path, State};
@@ -107,6 +107,13 @@ fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
 pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, String> {
     let state: &AppState = &admin.state;
     match name {
+        // ==================== 实机环境档案（UI 导入） ====================
+        "client_profile_get" => to_json(client_profile::client_profile_get(state)),
+        "client_profile_import" => {
+            let content = arg(&args, "content")?;
+            client_profile::client_profile_import(state, content).and_then(to_json)
+        }
+        "client_profile_clear" => client_profile::client_profile_clear(state).and_then(to_json),
         // ==================== accounts（账号/分组/积分） ====================
         "accounts_list" => to_json(accounts::accounts_list(state)),
         "accounts_export_raw" => accounts::accounts_export_raw(state),
