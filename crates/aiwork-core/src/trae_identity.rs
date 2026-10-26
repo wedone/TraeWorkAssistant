@@ -175,6 +175,83 @@ fn read_local_manifest() -> Option<TraeIdentity> {
     None
 }
 
+/// 内置设备指纹兜底：本机真实 Trae CN 客户端实测（2026-10-26）
+/// - os_version：客户端取 Node `os.version()`，本机实测 "Windows 10 Pro"
+/// - device_model / device_manufacturer：客户端取系统信息 SDK，本机 WMI 实测
+///   Model=INVALID、Manufacturer=LENOVO（客户端原样上报，不做修正）
+/// - cpu：客户端取 CPU 型号解析出的厂商名，本机为 Intel
+const DEFAULT_OS_NAME: &str = "windows";
+const DEFAULT_OS_VERSION: &str = "Windows 10 Pro";
+const DEFAULT_DEVICE_MODEL: &str = "INVALID";
+const DEFAULT_DEVICE_MANUFACTURER: &str = "LENOVO";
+const DEFAULT_CPU: &str = "Intel";
+
+/// 设备指纹档案（P1）。
+///
+/// 真实客户端把同一份 `commonParams` 同时用于路由请求头（`x-device-brand` /
+/// `x-device-type` / `x-os-version`）与 `DeviceInfo`（DeviceModel / DeviceBrand /
+/// DeviceCPU / OSInfo / OSVersion）。此前这些值分散硬编码在 routes/models_sync/oauth
+/// 三处且互相矛盾（`CREFG-XX`、`Windows 11 Home China`），本身即是风险信号；
+/// 集中一处后可保证同一"虚拟机器"的型号、系统、CPU 永远自洽。
+///
+/// 取值优先级：环境变量 > 内置兜底（兜底即本机真实客户端值，非猜测）。
+#[derive(Debug, Clone)]
+pub struct ClientProfile {
+    /// 操作系统名，客户端 `systemInformation.osName` 口径：windows / mac / linux
+    pub os_name: String,
+    /// 操作系统版本，客户端 `os.version()` 口径（如 "Windows 10 Pro"）
+    pub os_version: String,
+    /// 设备型号，客户端 `systemInformation.deviceModel` 口径
+    pub device_model: String,
+    /// 设备厂商，客户端 `systemInformation.deviceManufacturer` 口径
+    pub device_manufacturer: String,
+    /// CPU 厂商，客户端 `cpuManufacturer` 口径
+    pub cpu: String,
+}
+
+static PROFILE: OnceLock<ClientProfile> = OnceLock::new();
+
+/// 进程级设备指纹（首次调用时解析并缓存）
+pub fn profile() -> &'static ClientProfile {
+    PROFILE.get_or_init(resolve_profile)
+}
+
+/// 操作系统名（x-device-type 取值）
+pub fn os_name() -> &'static str {
+    &profile().os_name
+}
+
+/// 操作系统版本（x-os-version / DeviceInfo.OSVersion 取值）
+pub fn os_version() -> &'static str {
+    &profile().os_version
+}
+
+/// 设备型号（x-device-brand / DeviceInfo.DeviceModel 取值）
+pub fn device_model() -> &'static str {
+    &profile().device_model
+}
+
+/// 设备厂商（DeviceInfo.DeviceBrand 取值）
+pub fn device_manufacturer() -> &'static str {
+    &profile().device_manufacturer
+}
+
+/// CPU 厂商（x-device-cpu / DeviceInfo.DeviceCPU 取值）
+pub fn cpu() -> &'static str {
+    &profile().cpu
+}
+
+fn resolve_profile() -> ClientProfile {
+    ClientProfile {
+        os_name: env_nonempty("TRAE_OS_NAME").unwrap_or_else(|| DEFAULT_OS_NAME.into()),
+        os_version: env_nonempty("TRAE_OS_VERSION").unwrap_or_else(|| DEFAULT_OS_VERSION.into()),
+        device_model: env_nonempty("TRAE_DEVICE_MODEL").unwrap_or_else(|| DEFAULT_DEVICE_MODEL.into()),
+        device_manufacturer: env_nonempty("TRAE_DEVICE_MANUFACTURER")
+            .unwrap_or_else(|| DEFAULT_DEVICE_MANUFACTURER.into()),
+        cpu: env_nonempty("TRAE_DEVICE_CPU").unwrap_or_else(|| DEFAULT_CPU.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +269,17 @@ mod tests {
             "version_code 应为纯数字，实际 {}",
             id.version_code
         );
+    }
+
+    /// 设备指纹字段非空：这些值会原样写进请求头与 DeviceInfo，
+    /// 空值即为真实客户端不会出现的形态
+    #[test]
+    fn client_profile_fields_are_non_empty() {
+        let p = profile();
+        assert!(!p.os_name.is_empty());
+        assert!(!p.os_version.is_empty());
+        assert!(!p.device_model.is_empty());
+        assert!(!p.device_manufacturer.is_empty());
+        assert!(!p.cpu.is_empty());
     }
 }

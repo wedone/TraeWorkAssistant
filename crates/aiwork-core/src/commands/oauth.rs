@@ -591,11 +591,11 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
     // issue #76：登录设备 = 本机凭证中已绑定账号数最少的一套（分散服务端每设备
     // 绑定上限）；Web-only 无本机凭证时为本次登录生成 synthetic 身份
     let (device_id, machine_id) = select_login_device(state);
-    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
-    let trace_id = random_hex(32);
+    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）；
+    // 真实客户端取 randomUUID()，形态为 8-4-4-4-12 的 UUID v4，而非裸 32 hex
+    let trace_id = uuid_v4();
     let (pkce_verifier, code_challenge) = pkce_pair();
 
-    let hostname = login_page_hostname();
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\
@@ -611,8 +611,8 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         &device_id={device_id}\
         &x_device_id={device_id}\
         &x_machine_id={machine_id}\
-        &x_device_brand={hostname}\
-        &x_device_type=windows\
+        &x_device_brand={device_brand}\
+        &x_device_type={device_type}\
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
@@ -626,8 +626,11 @@ pub fn oauth_get_login_url(state: &AppState) -> OAuthLoginUrl {
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
         machine_id = machine_id,
         device_id = device_id,
-        hostname = urlencoding::encode(&hostname),
-        os_version = urlencoding::encode("Windows"),
+        // 与推理/模型同步同源：真实客户端此三参数取 systemInformation，
+        // x_device_brand 即 deviceModel（不是主机名），x_os_version 即 os.version()
+        device_brand = urlencoding::encode(crate::trae_identity::device_model()),
+        device_type = crate::trae_identity::os_name(),
+        os_version = urlencoding::encode(crate::trae_identity::os_version()),
         app_version = crate::trae_identity::app_version(),
         code_challenge = code_challenge,
     );
@@ -902,13 +905,15 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
                     "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
                     "DeviceType": "PC",
                     "DeviceName": "",
-                    "DeviceModel": "",
+                    // 与推理/模型同步共用同一份设备指纹（trae_identity::profile），
+                    // 真实客户端此五字段非空，留空本身即反常
+                    "DeviceModel": crate::trae_identity::device_model(),
                     "ClientVersion": cred.app_version,
                     "DevicePublicKey": pub_pem,
-                    "DeviceBrand": "",
-                    "DeviceCPU": "",
-                    "OSInfo": "",
-                    "OSVersion": "",
+                    "DeviceBrand": crate::trae_identity::device_manufacturer(),
+                    "DeviceCPU": crate::trae_identity::cpu(),
+                    "OSInfo": crate::trae_identity::os_name(),
+                    "OSVersion": crate::trae_identity::os_version(),
                 },
                 "IDEVersion": cred.app_version,
             }),
@@ -1580,28 +1585,27 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
     Ok((user_id, user_name))
 }
 
-/// 登录 URL 设备品牌参数（x_device_brand，对齐真实客户端 telemetry 命名）：
-/// Windows 读 COMPUTERNAME；非 Windows（docker/Linux 部署）回退 HOSTNAME 或
-/// /etc/hostname，最终兜底 Windows-PC——URL 其余参数本就伪装 Windows 客户端
-///（x_device_type=windows 等），兜底保持同一伪装口径
-fn login_page_hostname() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("HOSTNAME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string("/etc/hostname")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_else(|| "Windows-PC".into())
-    }
+/// 生成 UUID v4 形态字符串（真实客户端 login_trace_id 取 randomUUID()）：
+/// 32 位十六进制按 8-4-4-4-12 分组，第 13 位固定 "4"（版本位），
+/// 第 17 位取 8/9/a/b（RFC 4122 variant 位）
+fn uuid_v4() -> String {
+    let h = random_hex(32);
+    let b = h.as_bytes();
+    let variant = match b[16] {
+        b'0'..=b'3' => '8',
+        b'4'..=b'7' => '9',
+        b'8'..=b'b' => 'a',
+        _ => 'b',
+    };
+    format!(
+        "{}-{}-4{}-{}{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        variant,
+        &h[17..20],
+        &h[20..32]
+    )
 }
 
 /// 取 uid 尾 6 位用于报错辨认，避免完整 uid 出现在提示中（B3 移植）
@@ -1893,6 +1897,28 @@ pub fn oauth_login(
 #[cfg(test)]
 mod oauth_tests {
     use super::*;
+
+    /// login_trace_id 形态回归：真实客户端取 randomUUID()，8-4-4-4-12 且版本位为 4、
+    /// variant 位为 8/9/a/b；裸 32 hex 与真实客户端不一致，属可识别指纹差异
+    #[test]
+    fn uuid_v4_has_rfc4122_shape() {
+        for _ in 0..32 {
+            let s = uuid_v4();
+            assert_eq!(s.len(), 36, "UUID 长度应为 36：{s}");
+            let parts: Vec<&str> = s.split('-').collect();
+            let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+            assert_eq!(lens, vec![8, 4, 4, 4, 12], "分组应为 8-4-4-4-12：{s}");
+            assert_eq!(&parts[2][..1], "4", "版本位应为 4：{s}");
+            assert!(
+                matches!(&parts[3][..1], "8" | "9" | "a" | "b"),
+                "variant 位应为 8/9/a/b：{s}"
+            );
+            assert!(
+                s.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+                "只应含十六进制与连字符：{s}"
+            );
+        }
+    }
 
     /// 定级回归（2026-10-06 缺陷）：app.log 实测响应形态必须被识别为 code=20101，
     /// 且判为「服务端明确拒绝」——旧实现对同一响应恒判「无 Error 信封」，
