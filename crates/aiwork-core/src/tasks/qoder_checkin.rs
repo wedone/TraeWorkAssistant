@@ -1195,6 +1195,36 @@ fn known_daily_fallback(
     merged.aggregate()
 }
 
+/// 盲发兜底结果 → (kind, message, reward) 统一映射（4 处调用点共用，port main
+/// aa4ec5a issue #141）。`fail_ctx = Some((k, m))`：空表路径——Failed 维持原空表
+/// 分类 `k`（根因仍是列表不可见，fail_kind=empty_campaigns 语义不变：调度器当日
+/// 重试排除 + 推送抑制照旧），兜底详情追加在原消息之后而非整体替换（fail_kind
+/// 派生与空表 app_log 诊断均按 starts_with 前缀判定，原消息在前不受影响；试领
+/// 409/503 详情透出后，候选池诊断 contains CAMPAIGN_NOT_ACTIVE_TAG 在空表路径
+/// 恢复可见）；`None`：零 CLAIMABLE 路径——Failed 直接归 fail，不掩盖（2026-10-07
+/// 误报「已领（此前已领）」修复点的延续口径）。
+fn run_fallback(
+    state: &AppState,
+    agent: &ureq::Agent,
+    urls: &QoderUrls,
+    access_token: &str,
+    learned: &mut Vec<(String, String)>,
+    table: &mut Vec<(String, String)>,
+    fail_ctx: Option<(&str, &str)>,
+) -> (String, String, Option<f64>) {
+    match known_daily_fallback(state, agent, urls, access_token, learned, table) {
+        FallbackOutcome::Success(m, r) => ("success".into(), m, r),
+        FallbackOutcome::AlreadyReplayed => {
+            ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
+        }
+        FallbackOutcome::Auth(r) => ("auth".into(), "登录态失效（401）".into(), r),
+        FallbackOutcome::Failed(fm, r) => match fail_ctx {
+            Some((k, m)) => (k.into(), format!("{m}；盲发试领全 miss：{fm}"), r),
+            None => ("fail".into(), fm, r),
+        },
+    }
+}
+
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
 /// `learned`：本轮跨账号共享的当日活动 id 重学习结果（多账号场景首个账号学到的
 /// id 直接惠及后续账号，campaign id 全局有效与账号无关）。
@@ -1314,16 +1344,7 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match known_daily_fallback(state, agent, &urls, &min_token, learned, table) {
-                        FallbackOutcome::Success(m, r) => ("success".into(), m, r),
-                        FallbackOutcome::AlreadyReplayed => {
-                            ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
-                        }
-                        FallbackOutcome::Auth(r) => {
-                            ("auth".into(), "登录态失效（401）".into(), r)
-                        }
-                        FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
-                    }
+                    run_fallback(state, agent, &urls, &min_token, learned, table, None)
                 }
             } else {
                 let mut kind = String::new();
@@ -1379,7 +1400,19 @@ fn process_account(
                 }
             }
         }
-        Err((k, m)) => (k, m, None),
+        Err((k, m)) => {
+            // 空表盲发兜底（issue #141，port main aa4ec5a）：上游按账号分桶投放
+            // 列表，本账号两种请求形态均不可见，但 claim 端点不受列表过滤约束
+            // （探针实证）且幂等——先盲发试领（多账号轮次 learned 通常已含当日
+            // id，首个账号靠 conf/内置表），命中即真实领取/回放确认，与零
+            // CLAIMABLE 路径同款
+            if m.starts_with(EMPTY_CAMPAIGNS_TAG) {
+                // Failed 分支保留原空表分类 + 详情追加的完整语义说明见 run_fallback 文档
+                run_fallback(state, agent, &urls, &min_token, learned, table, Some((k.as_str(), m.as_str())))
+            } else {
+                (k, m, None)
+            }
+        }
     };
 
     // 401：刷新一次仅重试失败分支（禁二次刷新，对齐 wb_checkin F-09）。
@@ -1433,20 +1466,7 @@ fn process_account(
                             if daily_credits_claimed_in_list(&campaigns, now) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
-                                match known_daily_fallback(
-                                    state, agent, &urls, &min_token, learned, table,
-                                ) {
-                                    FallbackOutcome::Success(m, r) => ("success".into(), m, r),
-                                    FallbackOutcome::AlreadyReplayed => (
-                                        "already".into(),
-                                        "每日奖励已领取（盲发回放确认）".into(),
-                                        None,
-                                    ),
-                                    FallbackOutcome::Auth(r) => {
-                                        ("auth".into(), "登录态失效（401）".into(), r)
-                                    }
-                                    FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
-                                }
+                                run_fallback(state, agent, &urls, &min_token, learned, table, None)
                             }
                         } else {
                             // kind 空串起步（对照首次路径）：全部 claim 失败时应判 fail
@@ -1496,7 +1516,18 @@ fn process_account(
                             (kind, messages.join("；"), reward)
                         }
                     }
-                    Err((k, m)) => (k, m, None),
+                    Err((k, m)) => {
+                        // 重试路径同款空表盲发兜底（issue #141，port main aa4ec5a）：
+                        // 刷新后列表仍不可见时，用刷新后的最小头令牌盲发试领，
+                        // 全 miss 才回落原分类（兜底详情追加在原消息后，保持空表
+                        // 前缀不变，同首次路径）
+                        if m.starts_with(EMPTY_CAMPAIGNS_TAG) {
+                            // 同首次路径：Failed 保留原空表分类 + 详情追加（见 run_fallback 文档）
+                            run_fallback(state, agent, &urls, &min_token, learned, table, Some((k.as_str(), m.as_str())))
+                        } else {
+                            (k, m, None)
+                        }
+                    }
                 };
                 kind = retry.0;
                 message = retry.1;

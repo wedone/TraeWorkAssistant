@@ -72,9 +72,16 @@ impl SessionKey {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return SessionKey::Explicit(cid.to_string());
+            return SessionKey::explicit(cid);
         }
         SessionKey::Fingerprint(fingerprint_messages(body))
+    }
+
+    /// 显式键统一构造（port main 74b4d55）：限长 128 字符——cid 进 sticky 表做
+    /// 会话匹配并随绑定留档，超长值放大存储体积；from_body / from_slice 两构造点
+    /// 共用，确定性截断保证 WB/Qoder 两侧匹配一致性
+    fn explicit(cid: &str) -> SessionKey {
+        SessionKey::Explicit(cid.chars().take(128).collect())
     }
 
     /// 从原始请求字节窄提取会话键（issue #138 P0）：语义对齐 [from_body]
@@ -90,7 +97,7 @@ impl SessionKey {
             if let Some(cid) =
                 p.conversation_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
             {
-                return SessionKey::Explicit(cid.to_owned());
+                return SessionKey::explicit(cid);
             }
             return SessionKey::Fingerprint(fingerprint_probe(&p.messages));
         }
@@ -98,7 +105,7 @@ impl SessionKey {
             if let Some(cid) =
                 c.conversation_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
             {
-                return SessionKey::Explicit(cid.to_owned());
+                return SessionKey::explicit(cid);
             }
         }
         SessionKey::Fingerprint(String::new())
@@ -785,6 +792,17 @@ mod tests {
             SessionKey::from_slice(&serde_json::to_vec(&explicit).unwrap()),
             SessionKey::from_body(&explicit)
         );
+        // 显式：超长 cid 按 chars 限长 128（port main 74b4d55），两构造点一致
+        let long = "长".repeat(200);
+        let long_body = json!({"conversation_id": long, "messages":[]});
+        let long_raw = serde_json::to_vec(&long_body).unwrap();
+        match (SessionKey::from_body(&long_body), SessionKey::from_slice(&long_raw)) {
+            (SessionKey::Explicit(a), SessionKey::Explicit(b)) => {
+                assert_eq!(a, b);
+                assert_eq!(a.chars().count(), 128);
+            }
+            _ => panic!("显式键两侧应一致"),
+        }
         // 指纹模式：string content 与 blocks content 等价、第 4+ 条不参与
         let msgs = json!([
             {"role":"user","content":[{"type":"text","text":"问题A"}]},

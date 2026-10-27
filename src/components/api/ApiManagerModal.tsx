@@ -16,9 +16,11 @@ import CustomModelsPanel from './CustomModelsPanel';
 import ClientProfilePanel from './ClientProfilePanel';
 import FingerprintSanitizePanel from './FingerprintSanitizePanel';
 import ResourceSummary from './ResourceSummary';
+import ToolAliasPanel from './ToolAliasPanel';
 import UsageStatsPanel from './UsageStatsPanel';
 
-type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'sanitize' | 'profile';
+type TabKey =
+  | 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'sanitize' | 'profile' | 'toolalias';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -28,6 +30,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'custom', label: '自定义模型' },
   { key: 'sanitize', label: '指纹清洗' },
   { key: 'profile', label: '实机环境' },
+  { key: 'toolalias', label: '工具别名' },
 ];
 
 export default function ApiManagerModal() {
@@ -87,6 +90,7 @@ export default function ApiManagerModal() {
         )}
         {tab === 'sanitize' && <FingerprintSanitizePanel />}
         {tab === 'profile' && <ClientProfilePanel />}
+        {tab === 'toolalias' && <ToolAliasPanel />}
       </div>
     </Modal>
   );

@@ -448,11 +448,15 @@ export interface CreditsDailySnapshot {
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
-/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
+/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘；
+ *  disabled 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），
+ *  与运行时 enabled 徽章不同构：disabled 源不参与调度且不对外发布） */
 export interface UnifiedModelSource {
   pool: 'trae' | 'buddy' | 'buddy-ai' | 'custom' | 'qoder';
   rate: number | null;
   enabled: boolean;
+  /** L1 显式禁用（issue #145）：true = 该源被管理端单模型开关停用 */
+  disabled: boolean;
 }
 
 /** 统一模型目录条目（api_unified_models 返回，实时聚合派生视图） */
@@ -536,6 +540,8 @@ export interface TraeModelMeta {
   context_length?: number | null;
   max_tokens?: number | null;
   supports_image?: boolean | null;
+  /** 渠道内单模型开关（issue #145）：null = 默认启用；false = 禁用该模型（不路由 Trae 源） */
+  enabled?: boolean | null;
 }
 
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
@@ -1422,4 +1428,15 @@ export interface ClientProfilePoolView {
     device_id: string;
     machine_id: string;
   };
+}
+
+// ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
+// 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，
+// 响应侧按逆映射回改（协议对客户端透明）。合并语义同指纹清洗：内置默认表始终
+// 生效，自定义表按 from 覆盖/追加；to=null 停用该规则（原名透传）。
+// 注意：别名必须请求/响应双向一致，不支持指纹清洗的 to="" 剥离语义
+export interface ToolAliasMapView {
+  rules: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
 }

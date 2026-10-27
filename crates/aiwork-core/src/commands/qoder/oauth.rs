@@ -83,7 +83,7 @@ pub fn qoder_oauth_login(
         qoder_oauth::DeviceFlow::new()
     };
     let auth_url = flow.auth_url.clone();
-    emit_progress(&emit, "init", "请打开 Qoder 授权页完成账号授权", Some(&auth_url));
+    emit_progress(&emit, "init", "请打开 Qoder 登录页完成账号授权", Some(&auth_url));
     emit_progress(&emit, "browser", "请在浏览器中完成 Qoder 账号授权（登录并确认）", Some(&auth_url));
 
     let state2 = state.clone();

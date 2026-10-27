@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::custom_lb::{self, FailKind};
 use super::custom_models::{self, CustomModel};
@@ -129,6 +130,78 @@ fn acct_display(cm: &CustomModel) -> String {
         Some(s) if !s.is_empty() => format!("{}#{}", cm.name, s),
         _ => cm.name.clone(),
     }
+}
+
+// ==================== 请求阶段分类与会话分组（issue #149 P1/P2） ====================
+
+/// 请求阶段分类（custom 池请求日志 stage 字段与会话流水 stage 列的统一口径）：
+/// - 末条消息 role=tool → "tool"（Agent 工具轮回传结果再问）
+/// - 末条 user 且历史无 assistant/tool → "main_first"（主对话首轮）
+/// - 末条 user 其他 → "main"（主对话续轮）
+/// - 其余（空 messages / system 开场等）→ "unknown"
+fn classify_stage(core: &Value) -> &'static str {
+    let Some(msgs) = core.get("messages").and_then(Value::as_array) else {
+        return "unknown";
+    };
+    match msgs.last().and_then(|m| m.get("role")).and_then(Value::as_str) {
+        Some("tool") => "tool",
+        Some("user") => {
+            let has_history = msgs.iter().any(|m| {
+                matches!(m.get("role").and_then(Value::as_str), Some("assistant") | Some("tool"))
+            });
+            if has_history { "main" } else { "main_first" }
+        }
+        _ => "unknown",
+    }
+}
+
+/// 消息 content 文本提取：字符串直取；数组形态（多模态 parts）拼接各 part 的
+/// text 字段（非文本部件忽略）
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// 会话分组键（issue #149 P2）：取前 2 条消息（role|content| 拼接）SHA256 前
+/// 4 字节 hex，"cv|" 前缀。不复用 sticky 指纹（pool_session_key 取前 3 条窗口，
+/// 轮 2+ 起 assistant/tool 消息挤入后跨轮不稳定）；前 2 条为对话开场白，多轮间
+/// 稳定不变。
+fn conversation_key(core: &Value) -> String {
+    let empty: Vec<Value> = Vec::new();
+    let msgs = core.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+    let mut feed = String::new();
+    for m in msgs.iter().take(2) {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        let text = m.get("content").map(content_text).unwrap_or_default();
+        feed.push_str(role);
+        feed.push('|');
+        feed.push_str(&text);
+        feed.push('|');
+    }
+    let digest = Sha256::digest(feed.as_bytes());
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("cv|{hex}")
+}
+
+/// 末条用户消息预览（会话明细展示用）：倒序找首条 user 消息，content 文本截
+/// 前 200 字符（与 qoder preview 口径一致）
+fn last_user_preview(core: &Value) -> String {
+    let empty: Vec<Value> = Vec::new();
+    let msgs = core.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+    msgs.iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .map(content_text)
+        .map(|t| t.chars().take(200).collect::<String>())
+        .unwrap_or_default()
 }
 
 /// 组内选下一上游：粘性命中优先（跳过计数器；粘住条目已 tried 或被 Key 白名单
@@ -283,6 +356,16 @@ pub fn custom_stream_chat(
         // 轮换上限 min(N, 3)（与 wb/qoder 轮换耗尽口径一致）
         let prepared_core = parse_body_once(&body_vec);
         let session_key = super::dispatch::pool_session_key(&prepared_core);
+        // issue #149 P1/P2：请求阶段分类 + 会话上下文（loop 外一次，全 attempt 共用；
+        // 组内轮换重发同一请求体，阶段/会话键/预览不随 attempt 变化）
+        let stage = classify_stage(&prepared_core);
+        let session_ctx = super::usage::CustomSessionCtx {
+            session_id: conversation_key(&prepared_core),
+            stage,
+            uid: key_id.clone(),
+            key_name: key_name.clone(),
+            preview: last_user_preview(&prepared_core),
+        };
         let canonical = super::unified_catalog::canonical_id(&model);
         let mut tried: HashSet<String> = HashSet::new();
         let max_attempts = group.len().min(3);
@@ -296,9 +379,9 @@ pub fn custom_stream_chat(
             else {
                 // 组内全熔断/已试尽/白名单排除（pool_health 前置下理论不可达，防御性兜底）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
-                state.logger.log_request(
+                state.logger.log_request_stage(
                     "custom", "POST", proto.log_path(), &model, true, 503, "custom",
-                    start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(&last_err),
+                    start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(stage), Some(&last_err),
                 );
                 state.logger.log_debug_line(format!(
                     "[DEBUG] UPSTREAM_GROUP_EXHAUSTED tried={} pool=custom model={} 组内无可用上游（全熔断或已试尽）",
@@ -318,13 +401,13 @@ pub fn custom_stream_chat(
                     // 未向客户端产出任何字节，可轮换
                     custom_lb::note_circuit_failure(&cm.id, classify_failure(status));
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
+                    state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0, &session_ctx);
                     let preview: String = resp_body.chars().take(200).collect();
                     last_err = format!("自定义上游错误（status {}）：{}", status, preview);
                     set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
-                    state.logger.log_request(
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, true, status, "custom",
-                        duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
+                        duration_ms, &key_name, &acct_name, Some(stage), Some(&format!("upstream status={}", status)),
                     );
                     attempt += 1;
                     if attempt >= max_attempts {
@@ -344,10 +427,10 @@ pub fn custom_stream_chat(
                         // 首字超时（F-34 语义）：10s 内上游未产出任何字节 → 可轮换
                         custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
-                        state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
-                        state.logger.log_request(
+                        state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0, &session_ctx);
+                        state.logger.log_request_stage(
                             "custom", "POST", proto.log_path(), &model, true, 504, "custom",
-                            duration_ms, &key_name, &acct_name, Some("first byte timeout"),
+                            duration_ms, &key_name, &acct_name, Some(stage), Some("first byte timeout"),
                         );
                         last_err = "自定义上游 10 秒内未响应（首字超时）".into();
                         attempt += 1;
@@ -383,16 +466,16 @@ pub fn custom_stream_chat(
                             );
                             state.record_usage_custom(
                                 &model, &key_id, ok, true,
-                                duration_ms, pt, ct,
+                                duration_ms, pt, ct, &session_ctx,
                             );
                         }
                         if failed_inline {
                             // 流内失败已透传客户端（wb_route 同口径）：不重试、不清熔断、
                             // 不绑粘性、亦不记账熔断——错误已原样给到客户端，内容类失败
                             // 计入冷却会造成上游过度冷却
-                            state.logger.log_request(
+                            state.logger.log_request_stage(
                                 "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                duration_ms, &key_name, &acct_name, Some("流内失败已透传客户端"),
+                                duration_ms, &key_name, &acct_name, Some(stage), Some("流内失败已透传客户端"),
                             );
                             break;
                         }
@@ -403,9 +486,9 @@ pub fn custom_stream_chat(
                                 if let Some(sk) = &session_key {
                                     custom_lb::record_sticky_upstream(&state, sk, &cm.id);
                                 }
-                                state.logger.log_request(
+                                state.logger.log_request_stage(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, None,
+                                    duration_ms, &key_name, &acct_name, Some(stage), None,
                                 );
                                 break;
                             }
@@ -413,9 +496,9 @@ pub fn custom_stream_chat(
                                 custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
                                 last_err = format!("code={code} msg={msg}");
                                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
-                                state.logger.log_request(
+                                state.logger.log_request_stage(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, Some(&msg),
+                                    duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
                                 );
                                 // SSE 铁律：sent_any 后就地收尾，不轮换（不拼第二份响应）
                                 attempt += 1;
@@ -478,6 +561,16 @@ pub async fn custom_aggregate_chat(
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let prepared_core = parse_body_once(&body_vec);
         let session_key = super::dispatch::pool_session_key(&prepared_core);
+        // issue #149 P1/P2：请求阶段分类 + 会话上下文（loop 外一次，全 attempt 共用；
+        // 组内轮换重发同一请求体，阶段/会话键/预览不随 attempt 变化）
+        let stage = classify_stage(&prepared_core);
+        let session_ctx = super::usage::CustomSessionCtx {
+            session_id: conversation_key(&prepared_core),
+            stage,
+            uid: key_id.clone(),
+            key_name: key_name.clone(),
+            preview: last_user_preview(&prepared_core),
+        };
         let canonical = super::unified_catalog::canonical_id(&model);
         let mut tried: HashSet<String> = HashSet::new();
         let max_attempts = group.len().min(3);
@@ -493,9 +586,9 @@ pub async fn custom_aggregate_chat(
                 // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 // 日志记 502（与下方 openai_error(BAD_GATEWAY) 实收一致；stream 路径为 503）
-                state.logger.log_request(
+                state.logger.log_request_stage(
                     "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
-                    start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(&last_err),
+                    start_ts.elapsed().as_millis() as u64, &key_name, "-", Some(stage), Some(&last_err),
                 );
                 break;
             };
@@ -508,7 +601,7 @@ pub async fn custom_aggregate_chat(
                 Err((status, resp_body)) => {
                     custom_lb::note_circuit_failure(&cm.id, classify_failure(status));
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
                     let preview: String = resp_body.chars().take(200).collect();
                     last_err = format!("自定义上游错误（status {}）：{}", status, preview);
                     set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
@@ -516,9 +609,9 @@ pub async fn custom_aggregate_chat(
                     // （与 WB 聚合路径同口径，保留上游侧可观测信息）；客户端实收恒为
                     // BAD_GATEWAY 502，对齐由组耗尽收尾日志行落（stream 路径错误即
                     // 下发同码，天然自洽）
-                    state.logger.log_request(
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, status, "custom",
-                        duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
+                        duration_ms, &key_name, &acct_name, Some(stage), Some(&format!("upstream status={}", status)),
                     );
                     attempt += 1;
                     if attempt >= max_attempts {
@@ -532,10 +625,10 @@ pub async fn custom_aggregate_chat(
                 Err(()) => {
                     custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
-                    state.logger.log_request(
+                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, 504, "custom",
-                        duration_ms, &key_name, &acct_name, Some("first byte timeout"),
+                        duration_ms, &key_name, &acct_name, Some(stage), Some("first byte timeout"),
                     );
                     last_err = "自定义上游 10 秒内未响应（首字超时）".into();
                     attempt += 1;
@@ -557,10 +650,10 @@ pub async fn custom_aggregate_chat(
                         super::usage::UsageBucket::Custom,
                         r.get("usage").map(wb_sse::cached_tokens_of).unwrap_or(0),
                     );
-                    state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
-                    state.logger.log_request(
+                    state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct, &session_ctx);
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms,
-                        &key_name, &acct_name, None,
+                        &key_name, &acct_name, Some(stage), None,
                     );
                     // 成功：清熔断 + 记会话粘上游
                     custom_lb::clear_circuit(&cm.id);
@@ -571,11 +664,11 @@ pub async fn custom_aggregate_chat(
                 }
                 (None, Some((code, msg))) => {
                     custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
-                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
                     set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
-                    state.logger.log_request(
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
-                        duration_ms, &key_name, &acct_name, Some(&msg),
+                        duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
                     );
                     // 本地聚合未向客户端产出任何字节 → 可安全轮换
                     last_err = msg;
@@ -586,10 +679,10 @@ pub async fn custom_aggregate_chat(
                 }
                 _ => {
                     custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
-                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
-                    state.logger.log_request(
+                    state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
+                    state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
-                        duration_ms, &key_name, &acct_name, Some("empty response"),
+                        duration_ms, &key_name, &acct_name, Some(stage), Some("empty response"),
                     );
                     last_err = "自定义上游返回为空".into();
                     attempt += 1;

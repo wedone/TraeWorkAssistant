@@ -157,7 +157,11 @@ export default function ExpiryTab({
         const expires: number[] = [];
         for (const p of activePkgs) {
           const endTs = dateStrToEndTs(p.expire_at);
-          if (endTs != null) expires.push(endTs);
+          // 长期有效哨兵过滤（issue #141，port main aa4ec5a）：上游对长期有效包
+          // 返回 9999-12-31 大哨兵，Math.min 会把「最近到期」显示成 9999/12/31——
+          // 与到期日历 PERPETUAL_TS 同口径剔除；全部包为长期有效时
+          // nearestExpire=null 显示「—」（日历仍以「长期有效」展示）
+          if (endTs != null && endTs < PERPETUAL_TS) expires.push(endTs);
         }
         // 最近到期含 Plan 订阅周期（到期即重置；仅剩余额度 > 0 计入，与到期日历一致）
         const planEnd = dateStrToEndTs(a.plan_expires_at);
@@ -170,7 +174,9 @@ export default function ExpiryTab({
         );
         const pkgCount =
           activePkgs.length + (!hasPlanPkg && planEnd != null && (a.plan_credits ?? 0) > 0 ? 1 : 0);
-        if (planEnd != null && (a.plan_credits ?? 0) > 0) expires.push(planEnd);
+        if (planEnd != null && planEnd < PERPETUAL_TS && (a.plan_credits ?? 0) > 0) {
+          expires.push(planEnd);
+        }
         out.push({
           key: `qoder-${a.user_id}`,
           platform: 'Qoder',

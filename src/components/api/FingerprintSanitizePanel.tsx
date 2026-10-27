@@ -27,9 +27,16 @@ import type { FingerprintSample, SanitizeRule, SanitizeTier } from '../../types'
 const fmtTs = (ts: number | null) =>
   ts && ts > 0 ? new Date(ts * 1000).toLocaleString() : null;
 
+/** 规则行（稳定 key 包装，issue #150 引入）：key 自增分配、与规则内容无关——
+ * 编辑 from 或删除中间行时 React 按 key 复用 DOM，受控输入焦点不串行 */
+type RuleRow = { key: number; rule: SanitizeRule };
+
 export default function FingerprintSanitizePanel() {
   const toast = useAppStore((s) => s.pushToast);
-  const [rules, setRules] = useState<SanitizeRule[]>([]);
+  // 规则行（稳定 key 包装，见 RuleRow 注记）
+  const [rows, setRows] = useState<RuleRow[]>([]);
+  // 行 key 自增序列（跨 load/添加唯一，不随规则内容变化）
+  const rowSeq = useRef(0);
   const [savedRules, setSavedRules] = useState<SanitizeRule[]>([]);
   const [builtin, setBuiltin] = useState(true);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -65,7 +72,7 @@ export default function FingerprintSanitizePanel() {
     setLoading(true);
     try {
       const view = await api.wbConfig.templateMapGet(tier);
-      setRules(view.templates);
+      setRows(view.templates.map((rule) => ({ key: ++rowSeq.current, rule })));
       setSavedRules(view.templates);
       setBuiltin(view.builtin ?? false);
       setSavedAt(view.updated_at);
@@ -98,8 +105,8 @@ export default function FingerprintSanitizePanel() {
   }, [loadSamples]);
 
   const dirty = useMemo(
-    () => JSON.stringify(rules) !== JSON.stringify(savedRules),
-    [rules, savedRules],
+    () => JSON.stringify(rows.map((r) => r.rule)) !== JSON.stringify(savedRules),
+    [rows, savedRules],
   );
 
   /** 当前档位可用的样本数（样本按来源池归属档位，跨档位生成规则永不命中） */
@@ -147,8 +154,8 @@ export default function FingerprintSanitizePanel() {
   /** 保存前置校验：from 必填且全局唯一（from 是改写锚点，重复会导致不可预期次序） */
   const validate = (): string | null => {
     const seen = new Set<string>();
-    for (let i = 0; i < rules.length; i++) {
-      const from = rules[i].from.trim();
+    for (let i = 0; i < rows.length; i++) {
+      const from = rows[i].rule.from.trim();
       if (!from) return `第 ${i + 1} 条规则的「原文指纹」不能为空`;
       if (seen.has(from)) return `「原文指纹」重复：${from.slice(0, 40)}…`;
       seen.add(from);
@@ -167,7 +174,7 @@ export default function FingerprintSanitizePanel() {
       // to=null（停用）原样落库；to=""（剥离）保留空串，两者不可混淆
       await api.wbConfig.templateMapSet(
         tier,
-        rules.map((r) => ({ from: r.from.trim(), to: r.to === null ? null : r.to.trim() })),
+        rows.map((r) => ({ from: r.rule.from.trim(), to: r.rule.to === null ? null : r.rule.to.trim() })),
       );
       await load();
       toast('success', '清洗规则已保存，下一条请求即生效');
@@ -214,12 +221,12 @@ export default function FingerprintSanitizePanel() {
   const addFromSample = (sample: string, whole: boolean) => {
     try {
       const from = whole ? parseSystemText(sample) : parsePrefix(sample);
-      if (rules.some((r) => r.from.trim() === from)) {
+      if (rows.some((row) => row.rule.from.trim() === from)) {
         setSampleErr('该指纹的规则已存在，未重复添加');
         return;
       }
       setSampleErr(null);
-      setRules((rs) => [...rs, { from, to: '' }]);
+      setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from, to: '' } }]);
       toast('success', '已生成规则草案：请填写改写文本后保存');
     } catch (e) {
       setSampleErr(e instanceof Error ? e.message : String(e));
@@ -227,7 +234,9 @@ export default function FingerprintSanitizePanel() {
   };
 
   const updateRow = (i: number, patch: Partial<SanitizeRule>) => {
-    setRules((rs) => rs.map((r, k) => (k === i ? { ...r, ...patch } : r)));
+    setRows((rs) =>
+      rs.map((row, k) => (k === i ? { ...row, rule: { ...row.rule, ...patch } } : row)),
+    );
   };
 
   if (loading) {
@@ -286,7 +295,7 @@ export default function FingerprintSanitizePanel() {
       <div className="flex items-center gap-2">
         <span className="text-sm font-medium">规则列表</span>
         <Badge tone={builtin ? 'slate' : 'blue'}>{builtin ? '内置默认' : '自定义'}</Badge>
-        <span className="text-xs text-slate-400">{rules.length} 条</span>
+        <span className="text-xs text-slate-400">{rows.length} 条</span>
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={() => {
@@ -321,10 +330,10 @@ export default function FingerprintSanitizePanel() {
 
       {/* 规则行 */}
       <div className="space-y-1.5">
-        {rules.map((r, i) => {
+        {rows.map(({ key, rule: r }, i) => {
           const disabled = r.to === null;
           return (
-            <div key={i} className={`flex items-center gap-2 ${disabled ? 'opacity-60' : ''}`}>
+            <div key={key} className={`flex items-center gap-2 ${disabled ? 'opacity-60' : ''}`}>
               <span className="w-6 shrink-0 text-right text-xs tabular-nums text-slate-400">{i + 1}</span>
               <input
                 value={r.from}
@@ -364,7 +373,7 @@ export default function FingerprintSanitizePanel() {
                 停用
               </label>
               <button
-                onClick={() => setRules((rs) => rs.filter((_, k) => k !== i))}
+                onClick={() => setRows((rs) => rs.filter((_, k) => k !== i))}
                 className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
               >
                 删除
@@ -373,7 +382,9 @@ export default function FingerprintSanitizePanel() {
           );
         })}
         <button
-          onClick={() => setRules((rs) => [...rs, { from: '', to: '' }])}
+          onClick={() =>
+            setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from: '', to: '' } }])
+          }
           className="flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-slate-300 py-2 text-xs text-slate-500 transition hover:border-brand-400 hover:text-brand-500 dark:border-zinc-700 dark:text-zinc-400"
         >
           <Plus size={13} />

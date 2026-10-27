@@ -207,7 +207,9 @@ pub(crate) fn gen_conv_id() -> String {
 // ==================== 模型级冷却（T2.7/F-34） ====================
 
 /// 模型是否处于冷却中；返回剩余秒数（视图感知：buddy-ai 档读独立冷却表）
-pub fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
+// pub(crate)：参数持 crate 私有类型 WbView，本组函数无跨 crate 消费方
+//（消除 private_interfaces 警告）
+pub(crate) fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
     let map = safe_lock(&state.route_model_cooldowns());
     let (until, _) = map.get(model)?;
     let now = now_ts();
@@ -220,7 +222,7 @@ pub fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
 
 /// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
 /// 带错误消息时先尝试解析精确恢复时刻（note_model_failure_ex）。
-pub fn note_model_failure(state: &WbView, model: &str) {
+pub(crate) fn note_model_failure(state: &WbView, model: &str) {
     note_model_failure_ex(state, model, None);
 }
 
@@ -229,7 +231,7 @@ pub fn note_model_failure(state: &WbView, model: &str) {
 ///    errors.rs 情报互证 2026-10-03）→ 冷却至精确恢复时刻（钳制 ≤7 天防异常值）；
 /// ② 解析失败/无消息 → 既有渐进退避。后续不可解析的失败取「渐进退避 vs 既有
 ///    冷却截止」的较大者——账号实际仍被限额到恢复时刻，不能被 10s 渐进值缩短。
-pub fn note_model_failure_ex(state: &WbView, model: &str, msg: Option<&str>) {
+pub(crate) fn note_model_failure_ex(state: &WbView, model: &str, msg: Option<&str>) {
     let mut map = safe_lock(&state.route_model_cooldowns());
     let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
     let fails = fails + 1;
@@ -333,7 +335,7 @@ fn upstream_msg(resp_body: &str) -> Option<String> {
 }
 
 /// 请求成功后清除该模型的冷却与失败计数
-pub fn clear_model_failure(state: &WbView, model: &str) {
+pub(crate) fn clear_model_failure(state: &WbView, model: &str) {
     safe_lock(&state.route_model_cooldowns()).remove(model);
 }
 
@@ -344,13 +346,26 @@ pub fn clear_model_failure(state: &WbView, model: &str) {
 /// 兼容）；KV 缺失/损坏/空表 = 纯默认。issue #99 ⑥ 合并语义：内置默认表全量
 /// 生效，自定义表按 from 逐字覆盖（merged_template_rules）——默认表新增布防
 /// 规则自动对存量自定义生效，不再被旧「整体替代」语义吞掉
-pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
+pub(crate) fn load_templates(state: &WbView) -> Vec<(String, String)> {
     // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）；
     // buddy-ai 档独立键 `buddy_ai_template_map`（§4.3 分区清洗）
     let custom = crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::TemplateMapFile>(state.templates_key())
         .into_rules();
     wb_payload::merged_template_rules(custom)
+}
+
+/// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
+/// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
+/// 单键不分档；当前接线面仅 Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）——WB 池（wb_sse
+/// 管线）与 qoder 未接入，接入时同键复用即可（工具集指纹是上游风控家族
+/// 共性，分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
+    let custom = crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
+        .into_rules();
+    wb_payload::merged_tool_alias_rules(custom)
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -365,8 +380,10 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
         return ErrKind::None;
     }
     // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
-    // 禁用待申诉（申诉成功后 UI 手动启用恢复）；流内走既有 kind 分支——
+    // 禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录账号即随
+    // 池快照重建恢复调度；流内走既有 kind 分支——
     // 未流出 break 换号接替 / 已流出就地收尾，禁用与解绑粘性由 note_error 生效
+    // （注释纠偏 port main 2fe9396）
     if code == 11140 || super::retry::is_account_restricted_error(msg) {
         return ErrKind::Forbidden;
     }

@@ -602,10 +602,19 @@ pub fn resolve_target(
         (model.to_string(), None, false)
     };
     let canonical = canonical_id(&trae_final.0);
+    // issue #145 渠道内单模型开关：L1 meta.enabled=false 的模型不再作为 Trae 源
+    // 参与调度（目录保留条目，管理端可重新启用）。其余源判定不受影响——多源模型
+    // 仍可由 Buddy/Qoder/custom 服务；唯一源被禁则选池循环耗尽 → NoHealthy
+    //（免费账号请求付费受限模型的场景由该开关根治，配合 PaidRestricted 不误冷却）
+    let trae_model_disabled = super::unified_catalog::load_meta(&state.data_dir)
+        .get(&canonical)
+        .and_then(|l| l.enabled)
+        .map_or(false, |e| !e);
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
     // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
-    let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none())
-        || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
+    let trae_hit = !trae_model_disabled
+        && ((buddy_hit.is_none() && qoder_hit.is_none())
+            || trae_list.iter().any(|m| canonical_id(&m.id) == canonical));
     let sources = ModelSources {
         buddy: buddy_hit,
         buddy_intl_only,

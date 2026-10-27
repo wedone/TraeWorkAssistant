@@ -129,8 +129,24 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
             }
         }
         "turn_completion" => {
-            // create_agent_task 曾使用 event:turn_completion，保留兼容
-            ev.finish_reason = "stop".to_string();
+            // create_agent_task 曾使用 event:turn_completion，保留兼容；
+            // finish_reason 优先读上游字段（缺失时回退 stop），不再硬编码——
+            // 硬编码会让工具回合收尾帧丢失 tool_calls 语义（issue #148，
+            // 升级逻辑见 stream_convert_src 收尾分支）
+            // 审查加固：值过 OpenAI 词表白名单，词表外/空值归 stop——旧实现
+            // 硬编码 stop 兼具归一化效果，裸透传会让非词表值（如 "completed"）
+            // 污染 OpenAI 出口（收尾帧 / aggregate / aggregate_text）
+            const KNOWN_FINISH: [&str; 5] =
+                ["stop", "length", "tool_calls", "function_call", "content_filter"];
+            let fr = obj
+                .get("finish_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ev.finish_reason = if KNOWN_FINISH.contains(&fr) {
+                fr.to_string()
+            } else {
+                "stop".to_string()
+            };
         }
         "error" => {
             ev.error_code = obj.get("code").and_then(|v| v.as_i64());
@@ -145,6 +161,18 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
     Some(ev)
 }
 
+/// 工具名逆向回改映射（issue #150）：请求侧 apply_tool_alias_forward 产出的
+/// 别名→原名逆映射，按请求作用域（与账号/轮换无关）；None = 无工具别名
+type ToolAliasReverse = std::collections::HashMap<String, String>;
+
+/// 工具名逆向回改（issue #150）：响应侧把上游所见别名换回客户端原名——
+/// 客户端按名匹配响应 tool_calls/tool_use，单向改名即废。None / 未命中 = 原样
+fn rename_tool_back(map: Option<&ToolAliasReverse>, name: &mut String) {
+    if let Some(orig) = map.and_then(|m| m.get(name.as_str())) {
+        *name = orig.clone();
+    }
+}
+
 /// 流式转换：SOLO SSE → OpenAI SSE chunks，逐 chunk 通过 sender 发送
 ///
 /// 返回 (错误信息, 是否已向客户端发送过数据, 上游 token usage)。
@@ -156,14 +184,16 @@ pub fn stream_convert_lines(
     lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_src(lines, sender, chat_id)
+    stream_convert_src(lines, sender, chat_id, tool_alias)
 }
 
 fn stream_convert_src(
     mut src: LineSrc,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
@@ -172,6 +202,10 @@ fn stream_convert_src(
     // 真实内容标记（正文/思考链/工具调用任一非空）；占位 role chunk 不计入。
     // 空完成（影子风控）检测依据（issue #57）
     let mut has_content = false;
+    // issue #148：本流是否出现过 tool_calls。Trae 上游对带工具调用的完成帧
+    // 误标 finish_reason=stop，逐字透传会被严格客户端（Vercel AI SDK 等）
+    // 取消全部 pending 工具并结束回合——收尾帧需按此状态升级
+    let mut saw_tool_calls = false;
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
@@ -242,6 +276,19 @@ fn stream_convert_src(
                                         let mut clean = fn_obj.clone();
                                         clean.remove("namespace");
                                         clean.remove("partial_arguments");
+                                        // issue #150：别名回改——上游所见的别名换回客户端原名
+                                        if let Some(m) = tool_alias {
+                                            if let Some(n) =
+                                                clean.get("name").and_then(Value::as_str)
+                                            {
+                                                if let Some(orig) = m.get(n) {
+                                                    clean.insert(
+                                                        "name".into(),
+                                                        Value::String(orig.clone()),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         if let Some(obj) = c.as_object_mut() {
                                             obj.insert("function".into(), Value::Object(clean));
                                         }
@@ -250,6 +297,7 @@ fn stream_convert_src(
                                 })
                                 .collect();
                             if !converted.is_empty() {
+                                saw_tool_calls = true;
                                 delta.insert("tool_calls".into(), json!(converted));
                             }
                         }
@@ -292,7 +340,18 @@ fn stream_convert_src(
                         ));
                         break;
                     }
-                    let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
+                    // issue #148：OpenAI 语义要求本流出现过 tool_calls 时收尾帧
+                    // finish_reason 必须为 "tool_calls"（无论上游给 stop、空串还是
+                    // turn_completion 缺省 stop），否则客户端取消全部工具调用；
+                    // 仅升级 stop/空串，保留 length/content_filter 等真实截断语义
+                    let finish = if saw_tool_calls
+                        && (ev.finish_reason.is_empty() || ev.finish_reason == "stop")
+                    {
+                        "tool_calls"
+                    } else {
+                        ev.finish_reason.as_str()
+                    };
+                    let data = write_chunk(json!({}), finish, &pending_usage);
                     if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
                         break;
                     }
@@ -337,6 +396,12 @@ fn stream_convert_src(
                 super::EMPTY_COMPLETION_MSG.to_string(),
             ));
         } else {
+            // issue #148：EOF 兜底补发收尾帧（含 finish_reason）再发 [DONE]——
+            // 此前只发 [DONE]，客户端按缺省 stop 处理，带工具调用的半截流
+            // 同样会被取消工具
+            let finish = if saw_tool_calls { "tool_calls" } else { "stop" };
+            let data = write_chunk(json!({}), finish, &pending_usage);
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         }
     }
@@ -483,6 +548,9 @@ fn stream_convert_text_src(
                 super::EMPTY_COMPLETION_MSG.to_string(),
             ));
         } else {
+            // issue #148：EOF 兜底补发收尾帧（legacy text 无工具语义，固定 stop）
+            let data = write_chunk("", "stop", &pending_usage);
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         }
     }
@@ -564,6 +632,7 @@ fn merge_tool_slot(t: &mut Value, call: &Value) {
 fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
+    let mut saw_done = false;
     let mut out = PlainCollect {
         content: String::new(),
         reasoning: String::new(),
@@ -611,9 +680,16 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                     out.usage = Some(normalize_openai_usage(&ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    // 审查加固：双完成事件守卫对齐流式侧（首个完成事件生效，
+                    // 后到忽略）——否则 done 与 turn_completion、聚合与流式
+                    // 对同一上游形态可能产出不同 finish_reason
+                    if saw_done {
+                        continue;
+                    }
                     if !ev.finish_reason.is_empty() {
                         out.finish_reason = ev.finish_reason;
                     }
+                    saw_done = true;
                 }
                 "error" => {
                     out.error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
@@ -629,10 +705,27 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
 pub fn aggregate<R: Read + Send>(
     reader: R,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
-    let c = collect_plain(reader);
+    let mut c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // issue #150：别名回改——合并后的 tool_calls.function.name 还原客户端原名
+    if let Some(m) = tool_alias {
+        for t in c.tools.iter_mut() {
+            if let Some(orig) = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .and_then(|n| m.get(n))
+                .cloned()
+            {
+                if let Some(slot) = t.get_mut("function").and_then(Value::as_object_mut) {
+                    slot.insert("name".into(), Value::String(orig));
+                }
+            }
+        }
     }
 
     let mut message = json!({
@@ -643,9 +736,19 @@ pub fn aggregate<R: Read + Send>(
         message["reasoning_content"] = json!(c.reasoning);
     }
     // 审查修复（M6）：非流式聚合补发合并后的 tool_calls（与流式侧对称）
-    if !c.tools.is_empty() {
+    let has_tools = !c.tools.is_empty();
+    if has_tools {
         message["tool_calls"] = json!(c.tools);
     }
+
+    // issue #148：message.tool_calls 非空时 finish_reason 必须为 "tool_calls"——
+    // Trae 上游误标 stop 逐字透传会让 stream=false 客户端同样取消工具；
+    // 仅升级 stop（collect_plain 缺省值），保留 length/content_filter 等真实语义
+    let finish_reason = if has_tools && c.finish_reason == "stop" {
+        "tool_calls".to_string()
+    } else {
+        c.finish_reason
+    };
 
     let mut resp = json!({
         "id": chat_id,
@@ -655,7 +758,7 @@ pub fn aggregate<R: Read + Send>(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": c.finish_reason,
+            "finish_reason": finish_reason,
         }],
     });
     if let Some(u) = c.usage {
@@ -766,8 +869,9 @@ pub fn stream_convert_anthropic_lines(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_anthropic_src(lines, sender, msg_id, model)
+    stream_convert_anthropic_src(lines, sender, msg_id, model, tool_alias)
 }
 
 /// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
@@ -779,6 +883,7 @@ fn stream_convert_anthropic_src(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut message_started = false;
@@ -908,10 +1013,21 @@ fn stream_convert_anthropic_src(
                 cached_tokens = cached_tokens_of(u);
                 cache_write_tokens = cache_write_tokens_of(u);
             }
+            // issue #148：工具回合不得把误标的 stop/空串回落为 end_turn（严格
+            // 客户端会取消全部工具调用）。与 wb_sse P1 修复意图一致但规则更
+            // 保守——wb_sse 无条件强制 tool_use，此处仅升级 stop/空串，
+            // length/content_filter 等真实截断语义保留（→ max_tokens/refusal）
+            let stop_src = if !tools.is_empty()
+                && (finish_reason.is_empty() || finish_reason == "stop")
+            {
+                "tool_calls"
+            } else {
+                finish_reason.as_str()
+            };
             let mut message_delta = json!({
                 "type": "message_delta",
                 "delta": {
-                    "stop_reason": anthropic_stop_reason(&finish_reason),
+                    "stop_reason": anthropic_stop_reason(stop_src),
                     "stop_sequence": null,
                 },
                 "usage": {},
@@ -983,11 +1099,13 @@ fn stream_convert_anthropic_src(
                                     }
                                     None => continue,
                                 };
-                                let name = fn_obj
+                                let mut name = fn_obj
                                     .get("name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // issue #150：别名回改——tool_use.name 还原客户端原名
+                                rename_tool_back(tool_alias, &mut name);
                                 let args = fn_obj
                                     .get("arguments")
                                     .and_then(|a| a.as_str())
@@ -1115,9 +1233,11 @@ pub fn aggregate_anthropic<R: Read + Send>(
     reader: R,
     msg_id: &str,
     model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
+    let mut saw_done = false;
     let mut content = String::new();
     let mut finish_reason = "stop".to_string();
     let mut usage: Option<Value> = None;
@@ -1152,11 +1272,13 @@ pub fn aggregate_anthropic<R: Read + Send>(
                                     }
                                     None => continue,
                                 };
-                                let name = fn_obj
+                                let mut name = fn_obj
                                     .get("name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // issue #150：别名回改——tool_use.name 还原客户端原名
+                                rename_tool_back(tool_alias, &mut name);
                                 let args = fn_obj
                                     .get("arguments")
                                     .and_then(|a| a.as_str())
@@ -1196,9 +1318,14 @@ pub fn aggregate_anthropic<R: Read + Send>(
                     usage = Some(json!(ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    // 审查加固：双完成事件守卫对齐流式侧（首个完成事件生效）
+                    if saw_done {
+                        continue;
+                    }
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }
+                    saw_done = true;
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
@@ -1252,7 +1379,17 @@ pub fn aggregate_anthropic<R: Read + Send>(
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": anthropic_stop_reason(&finish_reason),
+        // issue #148：content 含 tool_use 块时，误标/缺省的 stop 不得回落为
+        // end_turn——wb_sse 的 Anthropic 聚合出口（completion_to_anthropic）
+        // 对此无条件强制 tool_use，此处仅升级 stop/空串并保留
+        // length/content_filter 等真实截断语义（更符合协议语义，测试锁定）
+        "stop_reason": anthropic_stop_reason(if !tools.is_empty()
+            && (finish_reason.is_empty() || finish_reason == "stop")
+        {
+            "tool_calls"
+        } else {
+            finish_reason.as_str()
+        }),
         "stop_sequence": null,
         "usage": usage_obj,
     });
@@ -1308,6 +1445,7 @@ mod tests {
             tx,
             "msg_t",
             "m",
+            None,
         );
         assert_eq!(error_info, Some((500, "boom".to_string())));
         assert!(sent_any, "已有内容发出时 sent_any 应为 true");
@@ -1337,6 +1475,7 @@ mod tests {
             tx,
             "msg_t",
             "m",
+            None,
         );
         assert_eq!(error_info, Some((4001, "model config is empty".to_string())));
         assert!(!sent_any, "流未开始：错误延迟给调用方决策（可重试）");
@@ -1353,12 +1492,12 @@ mod tests {
         let cursor_lines =
             std::io::Cursor::new(input).lines().map(|l| l.expect("读行失败"));
         let (e1, s1, _) =
-            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1");
+            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1", None);
         // 内存切分形态（首字超时包装产物形态）
         let (tx2, rx2) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let lines: InterruptibleLines =
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string)));
-        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1");
+        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1", None);
         assert_eq!(e1, e2);
         assert_eq!(s1, s2);
         let a = collect_events(rx).join("\n");
@@ -1379,6 +1518,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         let (code, msg) = error_info.expect("空完成必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
@@ -1400,6 +1540,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
@@ -1416,6 +1557,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            None,
         );
         assert!(error_info.is_none(), "有内容不得触发哨兵");
         assert!(sent_any);
@@ -1435,7 +1577,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"北京\\\"}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n",
         );
-        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
         assert!(err.is_none());
         let resp = resp.expect("tool_calls 流必须产出聚合结果");
         let msg = &resp["choices"][0]["message"];
@@ -1450,6 +1592,162 @@ mod tests {
             "arguments 跨事件字符串追加"
         );
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    // ==================== issue #148：工具回合 finish_reason 升级 ====================
+
+    #[test]
+    fn tool_call_stream_upgrades_stop_finish_reason() {
+        // Trae 上游：output 带 tool_calls + done 误标 stop → 收尾帧必须为 tool_calls
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        assert!(error_info.is_none());
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"finish_reason\":\"tool_calls\""),
+            "工具回合收尾帧必须升级为 tool_calls：{joined}"
+        );
+        assert!(
+            !joined.contains("\"finish_reason\":\"stop\""),
+            "不得透传上游误标的 stop：{joined}"
+        );
+        assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn tool_call_turn_completion_upgrades_default_stop() {
+        // turn_completion 兼容路径：缺省（{}）与显式空串（{"finish_reason":""}）
+        // 两种形态均按缺省 stop 处理并升级（空串经词表白名单归一化为 stop）
+        let tool_frame = "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n";
+        for done_data in ["{}", "{\"finish_reason\":\"\"}"] {
+            let input = format!("{tool_frame}event: turn_completion\ndata: {done_data}\n\n");
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+            let (error_info, _, _) = stream_convert_lines(
+                // lines() 借用局部 input，先收集为自有 Vec 以满足 'static
+                InterruptibleLines::from_iterator(Box::new(
+                    input
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                )),
+                tx,
+                "c1",
+                None,
+            );
+            assert!(error_info.is_none());
+            let joined = collect_events(rx).join("\n");
+            assert!(
+                joined.contains("\"finish_reason\":\"tool_calls\""),
+                "{done_data}: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_length_finish_reason_is_preserved() {
+        // 真实截断语义保留：工具回合 + 上游 length 不得升级为 tool_calls
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"length\"}\n\n",
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, _, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        assert!(error_info.is_none());
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"finish_reason\":\"length\""), "{joined}");
+    }
+
+    #[test]
+    fn tool_call_eof_fallback_sends_finish_frame() {
+        // 上游未发 done 即 EOF：兜底需补发含 finish_reason 的收尾帧，不能只发 [DONE]
+        let input = "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        assert!(error_info.is_none());
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"finish_reason\":\"tool_calls\""),
+            "EOF 兜底必须补发 tool_calls 收尾帧：{joined}"
+        );
+        assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn aggregate_upgrades_tool_call_finish_reason() {
+        // 非流式聚合：tool_calls 非空 + 上游误标 stop → finish_reason 置 tool_calls
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
+        );
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
+        assert!(resp["choices"][0]["message"]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn anthropic_tool_stream_forces_tool_use_stop_reason() {
+        // Anthropic 出口：工具块 + 上游误标 stop → message_delta.stop_reason 必须 tool_use
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert!(error_info.is_none());
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"stop_reason\":\"tool_use\""),
+            "工具回合 stop_reason 必须为 tool_use：{joined}"
+        );
+        assert!(
+            !joined.contains("\"stop_reason\":\"end_turn\""),
+            "不得透传 end_turn：{joined}"
+        );
+    }
+
+    #[test]
+    fn aggregate_anthropic_tool_use_stop_reason() {
+        // Anthropic 非流式聚合：tool_use 块 + 上游误标 stop → stop_reason 置 tool_use
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
+        );
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_t", "m", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(resp["stop_reason"], "tool_use");
+        assert!(resp["content"].as_array().expect("blocks").iter().any(|b| b["type"] == "tool_use"));
     }
 
     #[test]
@@ -1572,7 +1870,7 @@ mod tests {
             "data: {\"finish_reason\": \"stop\"}\n",
             "\n",
         );
-        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3");
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3", None);
         assert!(err.is_none());
         let resp = resp.expect("message");
         let usage = &resp["usage"];
@@ -1595,6 +1893,7 @@ mod tests {
             tx,
             "msg_cache",
             "m",
+            None,
         );
         assert!(error_info.is_none());
         let joined = collect_events(rx).join("\n");
@@ -1606,5 +1905,62 @@ mod tests {
             joined.contains("\"cache_creation_input_tokens\":2"),
             "message_delta 需透出缓存写: {joined}"
         );
+    }
+
+    // ==================== 工具名别名响应侧回改（issue #150）====================
+
+    const ALIAS_TOOL_SSE: &str = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function_call\":{\"name\":\"ask_user\",\"arguments\":\"{\\\"q\\\":\\\"1\\\"}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+
+    fn alias_reverse() -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("ask_user".to_string(), "ask_user_question".to_string());
+        m
+    }
+
+    /// OpenAI 流式：delta.tool_calls.function.name 把上游所见别名回改为客户端
+    /// 原名（请求侧改写 + 响应侧回改，协议对客户端透明）
+    #[test]
+    fn tool_alias_reverse_applied_on_openai_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let lines: InterruptibleLines =
+            InterruptibleLines::from_iterator(Box::new(ALIAS_TOOL_SSE.lines().map(str::to_string)));
+        let (e, s, _) = stream_convert_lines(lines, tx, "c1", Some(&alias_reverse()));
+        assert_eq!(e, None);
+        assert!(s);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("ask_user_question"), "{joined}");
+        assert!(
+            !joined.contains("\"ask_user\""),
+            "别名不得残留（原名为其前缀，须带引号精确断言）: {joined}"
+        );
+        // 收尾帧 finish_reason 应为 tool_calls（issue #148 语义）
+        assert!(joined.contains("\"finish_reason\":\"tool_calls\""), "{joined}");
+    }
+
+    /// OpenAI 非流式聚合：合并后 tool_calls.function.name 回改原名
+    #[test]
+    fn tool_alias_reverse_applied_on_aggregate() {
+        let (v, err) = aggregate(std::io::Cursor::new(ALIAS_TOOL_SSE), "c1", Some(&alias_reverse()));
+        assert!(err.is_none());
+        let v = v.expect("聚合应产出消息");
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            serde_json::json!("ask_user_question")
+        );
+    }
+
+    /// Anthropic 流式：tool_use.name 回改原名
+    #[test]
+    fn tool_alias_reverse_applied_on_anthropic_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let lines: InterruptibleLines =
+            InterruptibleLines::from_iterator(Box::new(ALIAS_TOOL_SSE.lines().map(str::to_string)));
+        let (e, s, _) = stream_convert_anthropic_lines(lines, tx, "msg_t", "m", Some(&alias_reverse()));
+        assert_eq!(e, None);
+        assert!(s);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"type\":\"tool_use\""), "{joined}");
+        assert!(joined.contains("ask_user_question"), "{joined}");
+        assert!(!joined.contains("\"ask_user\""), "别名不得残留: {joined}");
     }
 }

@@ -111,7 +111,18 @@ fn parse_key_file(raw: &[u8], path: &Path) -> Result<Vec<u8>, String> {
         ));
     };
     if hex.len() != 64 {
-        return Err(format!("vault 密钥格式异常（期望 64 位 hex，实际 {} 字符）", hex.len()));
+        return Err(format!(
+            "vault 密钥格式异常（V2: 后期望 64 位 hex，实际 {} 字符）",
+            hex.len()
+        ));
+    }
+    // hexdigit 全量校验（port main aa4ec5a issue #139 审查加固）：len() 是字节
+    // 长度，多字节 UTF-8 字符可凑足 64 字节，直接按字节切片会在 char boundary
+    // 中间 panic；先统一收敛为友好 Err（共享目录手工编辑污染场景）。
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "vault 密钥格式异常（V2: 后应为 64 位 ASCII hex，实际含非 hex 字符）".to_string(),
+        );
     }
     let mut key = [0u8; 32];
     for i in 0..32 {
@@ -162,14 +173,25 @@ fn open(
         let keyprovider = KeyProvider::try_from(Zeroizing::new(password))
             .map_err(|e| format!("vault 密钥初始化失败: {e}"))?;
         let sh = Stronghold::default();
-        // 快照文件存在才加载（首次启动无快照，直接新建 client）
-        if path.exists() {
+        // 快照存在性必须在加载前判定（port main aa4ec5a issue #139：供 client
+        // 加载失败时的错配防护判定；首次启动无快照，直接新建 client）
+        let snapshot_exists = path.exists();
+        if snapshot_exists {
             sh.load_snapshot(&keyprovider, &snapshot)
                 .map_err(|e| format!("打开 vault 快照失败: {e}"))?;
         }
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
-        // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失
+        // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失。
+        // 密钥/快照错配防护（port main aa4ec5a issue #139）：快照存在但 load_client
+        // 失败，大概率是 vault_key.bin（或 AIWORK_VAULT_KEY）与快照不匹配（如迁移
+        // 期间替换过密钥）——拒绝打开，禁止空 client 经 save() 覆盖原快照
         if sh.load_client(CLIENT_PATH.to_vec()).is_err() {
+            if snapshot_exists {
+                return Err(format!(
+                    "vault 快照已存在但 client 加载失败（{}）：大概率 vault_key.bin 与快照不匹配（如迁移期间替换过密钥）。已拒绝打开，防止空 client 覆盖快照；请恢复匹配的密钥或快照备份",
+                    path.display()
+                ));
+            }
             sh.create_client(CLIENT_PATH.to_vec())
                 .map_err(|e| format!("创建 vault client 失败: {e}"))?;
         }
@@ -751,6 +773,26 @@ mod tests {
         // env 密钥归一化：任意字符串 → 确定性 32 字节
         assert_eq!(normalize_key(b"my-vault-key"), normalize_key(b"my-vault-key"));
         assert_eq!(normalize_key(b"my-vault-key").len(), 32);
+    }
+
+    #[test]
+    fn key_provider_v2长度或字符非法时报错() {
+        let path = Path::new("vault_key.bin");
+        // 长度不对（63 位 hex）
+        let short = format!("V2:{}a", "ab".repeat(31));
+        let err = parse_key_file(short.as_bytes(), path).unwrap_err();
+        assert!(err.contains("64 位 hex"), "实际报错: {err}");
+        // 非 hex 字符（ASCII）→ 被 hexdigit 全量校验拦下
+        let bad = format!("V2:{}", "z".repeat(64));
+        let err = parse_key_file(bad.as_bytes(), path).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
+        // 多字节 UTF-8 且总字节长恰为 64（共享目录手工编辑污染场景）：
+        // é 从奇数字节偏移 61 开始，旧代码按字节切片会在 char boundary
+        // 中间 panic；须收敛为友好 Err（panic 回归用例，port main aa4ec5a）
+        let multibyte = format!("V2:{}éa", "a".repeat(61));
+        assert_eq!(multibyte.len(), 67); // 3 前缀 + 61 + 2 + 1 = 67 字节
+        let err = parse_key_file(multibyte.as_bytes(), path).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
     }
 
     #[cfg(windows)]

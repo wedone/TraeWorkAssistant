@@ -176,12 +176,19 @@ pub struct TraeModelMeta {
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub supports_image: Option<bool>,
+    /// 渠道内单模型开关（issue #145）：None = 默认启用；Some(false) = 禁用该模型
+    ///（目录保留条目并标记 disabled，dispatch 不再路由到 Trae 源）
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// 读取 L1 覆盖层（键 canonical_id；缺失/损坏回退空表）。
 /// SQLite 化（P2）：data/trae_model_meta.json → kv `trae_model_meta`。
+/// dispatch 热路径读取，经 config_cache 缓存（写路径 meta_set/meta_clear 显式失效）
 pub fn load_meta(data_dir: &Path) -> HashMap<String, TraeModelMeta> {
-    crate::store::db(data_dir).kv_get("trae_model_meta")
+    super::config_cache::get_or_load(data_dir, "trae_model_meta", || {
+        crate::store::db(data_dir).kv_get("trae_model_meta")
+    })
 }
 
 /// L1 写入（upsert；编辑弹框整条覆盖，官网同步不触碰本文件）
@@ -192,7 +199,9 @@ pub fn meta_set(data_dir: &Path, model: &str, meta: TraeModelMeta) -> Result<(),
     }
     let mut map = load_meta(data_dir);
     map.insert(id, meta);
-    crate::store::db(data_dir).kv_set("trae_model_meta", &map)
+    let res = crate::store::db(data_dir).kv_set("trae_model_meta", &map);
+    super::config_cache::invalidate(data_dir, "trae_model_meta");
+    res
 }
 
 /// L1 清除（恢复自动来源链 L2→L3→L4）；返回是否确有删除
@@ -202,6 +211,7 @@ pub fn meta_clear(data_dir: &Path, model: &str) -> Result<bool, String> {
     let removed = map.remove(&id).is_some();
     if removed {
         crate::store::db(data_dir).kv_set("trae_model_meta", &map)?;
+        super::config_cache::invalidate(data_dir, "trae_model_meta");
     }
     Ok(removed)
 }
@@ -280,12 +290,16 @@ pub fn unified_models_whitelisted_ex(
 
 // ==================== 统一目录聚合（§3.1/§3.3） ====================
 
-/// 单池来源（`enabled` 为运行时派生标记：wb_enabled / 账号池健康，不落盘 §3.3 #5）
+/// 单池来源（`enabled` 为运行时派生标记：wb_enabled / 账号池健康，不落盘 §3.3 #5；
+/// `disabled` 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），
+/// 与运行时 enabled 徽章不同构：disabled 源不参与调度且 /v1/models 不对外发布，
+/// 管理端仍全量可见以便重新启用）
 #[derive(Debug, Clone, Serialize)]
 pub struct UnifiedSource {
     pub pool: &'static str,
     pub rate: Option<f64>,
     pub enabled: bool,
+    pub disabled: bool,
 }
 
 /// 自定义模型上游组的目录聚合中间态（P1：同 canonical 多条合并为单行）——
@@ -476,7 +490,8 @@ pub fn unified_models_ex(
             continue;
         }
         order.push(canonical.clone());
-        let t = trae_entry_of(m, l1.get(&canonical));
+        let t_meta = l1.get(&canonical);
+        let t = trae_entry_of(m, t_meta);
         acc.insert(
             canonical.clone(),
             UnifiedModel {
@@ -494,6 +509,8 @@ pub fn unified_models_ex(
                     pool: "trae",
                     rate: t.rate,
                     enabled: enabled_of(TargetPool::Trae),
+                    // issue #145：L1 meta.enabled=false → 源级静态禁用
+                    disabled: t_meta.and_then(|l| l.enabled).map_or(false, |e| !e),
                 }],
                 manual: l1.contains_key(&canonical),
             },
@@ -515,6 +532,7 @@ pub fn unified_models_ex(
                     pool: "buddy",
                     rate: wrate,
                     enabled: enabled_of(TargetPool::Buddy),
+                    disabled: false,
                 });
                 // display / supports_image 保留 Trae 侧现值，候选记入 buddy_disp/img，
                 // 由末段按策略命中侧选定（L1 label 绝对优先，§3.2）
@@ -566,6 +584,7 @@ pub fn unified_models_ex(
                             pool: "buddy",
                             rate: wrate,
                             enabled: enabled_of(TargetPool::Buddy),
+                            disabled: false,
                         }],
                         manual: false,
                     },
@@ -649,6 +668,7 @@ pub fn unified_models_ex(
                     pool: "custom",
                     rate: crate_rate,
                     enabled: g.enabled,
+                    disabled: false,
                 });
                 // 审查修复（P2）：合并臂不再无条件覆盖 ctx/mt/supports_image——
                 // v3 起 custom 未必命中（候选序尾部兜底），声明改由末段按 hit
@@ -682,6 +702,7 @@ pub fn unified_models_ex(
                             pool: "custom",
                             rate: crate_rate,
                             enabled: g.enabled,
+                            disabled: false,
                         }],
                         manual: false,
                     },
@@ -728,6 +749,7 @@ pub fn unified_models_ex(
                         pool: "buddy-ai",
                         rate: None,
                         enabled: bai_enabled,
+                        disabled: false,
                     });
                 }
                 None => {
@@ -755,6 +777,7 @@ pub fn unified_models_ex(
                                 pool: "buddy-ai",
                                 rate: rate_of(&m),
                                 enabled: bai_enabled,
+                                disabled: false,
                             }],
                             manual: false,
                         },
@@ -818,6 +841,7 @@ pub fn unified_models_ex(
                         pool: "qoder",
                         rate: qrate,
                         enabled: enabled_of(TargetPool::Qoder),
+                        disabled: false,
                     });
                     if let Some(r) = qrate {
                         u.rate = Some(r);
@@ -867,6 +891,7 @@ pub fn unified_models_ex(
                                 pool: "qoder",
                                 rate: qrate,
                                 enabled: enabled_of(TargetPool::Qoder),
+                                disabled: false,
                             }],
                             manual: false,
                         },
@@ -1749,5 +1774,29 @@ mod tests {
             ],
             "L2 脏档位归一为空 → 回退 L3 实证表（xhigh 仅来自 L3）"
         );
+    }
+
+    /// issue #145 渠道内单模型开关：L1 meta.enabled=false → 该模型 Trae 源标记
+    /// disabled（目录条目保留，管理端可见可重新启用）；未设置/显式 true 不受影响
+    #[test]
+    fn t22_meta_enabled_false_marks_trae_source_disabled() {
+        let f = fixture(
+            &[("Kimi-K3.1-Pro", None), ("DeepSeek-V4-Flash", None)],
+            &[],
+            Some(json!({
+                "kimi-k3.1-pro": {"enabled": false},
+                "deepseek-v4-flash": {"enabled": true}
+            })),
+        );
+        let list = unified_models(&f.dir, true, true, true);
+        let kimi = find(&list, "Kimi-K3.1-Pro");
+        assert_eq!(kimi.sources.len(), 1, "wb 目录为空 → Kimi 仅 Trae 源");
+        assert!(
+            kimi.sources[0].disabled,
+            "meta.enabled=false → 源级静态禁用"
+        );
+        // 显式 true：与未设置同语义，不禁用
+        let ds = find(&list, "DeepSeek-V4-Flash");
+        assert!(ds.sources.iter().all(|s| !s.disabled));
     }
 }

@@ -120,7 +120,28 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error, None)
+    }
+
+    /// 记录一条 API 请求日志（附请求阶段字段，issue #149 P1，custom 池用）：
+    /// `stage`：请求阶段标签（main_first / main / tool / unknown），None 不输出该字段
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_request_stage(
+        &self,
+        pool: &str,
+        method: &str,
+        path: &str,
+        model: &str,
+        stream: bool,
+        status: u16,
+        uid: &str,
+        duration_ms: u64,
+        key_name: &str,
+        acct_name: &str,
+        stage: Option<&str>,
+        error: Option<&str>,
+    ) {
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error, stage)
     }
 
     /// 记录一条 API 请求日志（流式请求带 TTFB 首字耗时字段）
@@ -141,7 +162,7 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, key_name, acct_name, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, key_name, acct_name, error, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -159,12 +180,17 @@ impl ApiLogger {
         key_name: &str,
         acct_name: &str,
         error: Option<&str>,
+        stage: Option<&str>,
     ) {
         let (h, m, s) = Self::local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let ttfb_part = match ttfb_ms {
             Some(t) => format!(" ttfb={t}ms"),
+            None => String::new(),
+        };
+        let stage_part = match stage {
+            Some(s) => format!(" stage={s}"),
             None => String::new(),
         };
         let err_part = match error {
@@ -176,9 +202,9 @@ impl ApiLogger {
         let acct_disp = if acct_name.is_empty() { "-" } else { acct_name };
 
         let line = format!(
-            "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}\n",
+            "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}{}\n",
             h, m, s,
-            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, err_part,
+            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, stage_part, err_part,
         );
 
         self.enqueue(line);

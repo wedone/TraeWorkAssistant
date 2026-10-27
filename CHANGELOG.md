@@ -6,6 +6,46 @@
 
 ---
 
+## [1.5.8] · 2026-10-27 · 语义移植 main aa4ec5a => f04d495
+
+> 语义移植 main `aa4ec5a`（不含）=> `f04d495`（9 提交，未 merge）。跳过：切换器链路（095e3ca 部分、84a5402、c440b20，本分支无 switcher 模块）与豆包桌面端开关（c097170，本分支无 doubao 模块）。
+
+### 新功能
+
+- **渠道内单模型开关（#145）**：模型可按源启用/禁用（管理端手选 + 「已禁」徽标），dispatch 不再路由被禁源，网关目录全禁条目不发布。
+- **付费受限免误冷却（#145）**：新增 `PaidRestricted` 错误分类——免费账号打付费模型不再触发冷却/禁用/熔断（仅换号或 fail-fast）。
+- **自定义池会话明细（#149）**：请求级本地流水表（会话指纹 + 请求阶段 + 消息预览，90 天保留）；用量统计「自定义模型」新增按会话归并的明细表，可展开看各轮。
+- **工具名别名改写（#150）**：破解按 `tools` 工具名集合识别客户端的指纹风控——请求侧改名、响应侧自动回改（流式/聚合/Anthropic 双形态 + 对冲/重试同步重放）；管理面新增「工具别名」tab（内置默认表 + 自定义覆盖/停用，保存即生效）。
+
+### 修复
+
+- **finish_reason 误标 stop（#148）**：带工具调用的完成帧统一升级为 `tool_calls`，严格客户端不再取消 pending 工具。
+- **Qoder 凭证续期（#143）**：兼容 `device_token`/`expires_at` 响应形态，修复手动续期恒报「响应结构异常」。
+- **元数据编辑弹框串值（#146）**：快速连点模型时慢响应覆盖/残留旧值——序号令牌 + 回填期清空禁用；指纹清洗面板规则行改稳定 key。
+
+### 验证
+
+- `cargo test --workspace`（834 通过）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
+## [1.5.7] · 2026-10-25 · Qoder 登录直连 SSO + 签到盲发兜底 + vault 加固
+
+> 语义移植 main `2e02cfc`（不含）=> `aa4ec5a`（3 提交，未 merge）。跳过（OS/桌面专属或本分支不适用）：2fe9396 `commands/env.rs`（Windows 注册表安装检测 WOW6432Node，桌面探测模块本分支无此文件）与 `build-assets/installer-hooks.nsh`（NSIS 安装器注释，本分支无 build-assets）；aa4ec5a vault DPAPI 双格式自适应与 `AIWORK_VAULT_SHARED` 一次性迁移（桌面侧特性——本分支 vault 即 V2: hex 格式源头，DPAPI blob 维持明确迁移报错）、`commands/qoder/oauth.rs` 桌面 open_in_browser（Web 化已移除，授权页由前端 window.open）、AGENT.md / docs/tech-framework.md 的 Qoder OAuth 行（本分支无对应行）、版本号 chore（main 3.8.4，本分支版本自管）。74b4d55（issue #138）与本分支 1.5.5 的 3349a9e 为同题异构实现，仅补移植其独有增量。
+
+### 修复与加固
+
+- **粘性显式键限长 128 字符（74b4d55）**：`conversation_id` 超长值进 sticky 表会放大存储体积——from_body / from_slice 两构造点统一经 `SessionKey::explicit` 按 chars 截断 128，WB/Qoder 两侧确定性截断保证匹配一致性（附回归测试）。
+- **组/标签约束 no_healthy 提示分流（2fe9396）**：org 约束（展开条目必带池前缀）交集为空时，原「账号约束均指向其他资源池」提示与本池即该池的事实同句矛盾——改给「组/标签约束与本池账号交集为空」口径提示。
+- **custom_model_test 预检复用 norm_base（2fe9396）**：与保存侧 upsert 完全同口径（scheme 小写 + 剥默认端口 443/80 + 去尾斜杠），修复 `HTTPS://x:443/` 能保存、探活却被大小写敏感 starts_with 拒绝的两侧口径分裂。
+- **11140 禁用语义注释纠偏（2fe9396）**：mod.rs / retry.rs / wb_route.rs 三处「申诉成功后 UI 手动启用恢复」纠正为「禁用为内存态，无手动启用入口——重启或重新登录即随池快照重建恢复调度」。
+- **Qoder 登录直连 SSO（aa4ec5a issue #140）**：设备授权页自构 SSO 跳转会向 oauth_callback 写入显式 `:443` 端口，被 SSO 回调白名单拒绝（未登录用户经授权页登录必现 400）——改为直连 `qoder.cn/sso/login/aliyun?oauth_callback=<全量百分号编码的设备授权页（附 directLogin=true）>`；oauth_callback 全量编码、poll verifier 转义改 `urlencoding::encode`（删除本地最小转义 urlencode）；Web 端提示文案「授权页」→「登录页」。
+- **签到空表盲发兜底（aa4ec5a issue #141）**：活动列表对账号不可见（empty_campaigns）时先盲发试领（claim 端点不受列表过滤约束且幂等），命中即真实领取/回放确认；fail_kind=empty_campaigns 语义保持（原消息在前、兜底详情追加）；四处兜底 match 收敛为 `run_fallback` 共用。
+- **到期列表剔除长期有效哨兵（aa4ec5a issue #141）**：Qoder 到期列表对 9999-12-31 哨兵包按 `PERPETUAL_TS` 口径剔除（包到期与 Plan 订阅两处），防「最近到期」显示 9999/12/31。
+- **vault 加固（aa4ec5a issue #139）**：密钥文件 hex 全量校验（多字节 UTF-8 凑足 64 字节时旧代码按字节切片会 char boundary panic，收敛为友好 Err，附 panic 回归测试）；快照存在但 client 加载失败时拒绝打开（防密钥/快照错配时空 client 经 save() 覆盖原快照）。
+
+### 验证
+
+- `cargo test --workspace`（803 通过 0 失败，含本轮新增 wb_sticky 截断 / qoder_oauth SSO / vault hex 校验用例）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
 ## [1.5.6] · 2026-10-24 · 调度归因可观测 + 11140 账号级风控识别
 
 > 语义移植 main `21fc6fb`（不含）=> `2e02cfc`（9 提交，未 merge）。跳过 NSIS/更新链路、certutil/reg.exe/netstat 进程内化等 OS/桌面客户端专属改动（仅取其中调度配置弹框宽度一行）；main 自有 CHANGELOG 与版本 chore 由本分支自管版本替代。

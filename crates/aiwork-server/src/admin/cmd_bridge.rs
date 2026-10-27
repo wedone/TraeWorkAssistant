@@ -520,6 +520,12 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let map = arg(&args, "map")?;
             wb_config::wb_template_map_set(state, tier, map).and_then(to_json)
         }
+        // 工具别名表（移植 main f04d495 / issue #150：kv tool_alias_map，单键不分档）
+        "wb_tool_alias_map_get" => wb_config::wb_tool_alias_map_get(state),
+        "wb_tool_alias_map_set" => {
+            let map = arg(&args, "map")?;
+            wb_config::wb_tool_alias_map_set(state, map).and_then(to_json)
+        }
         // 指纹样本（issue #125 增强：一键从样本生成清洗规则）
         "fingerprint_samples_get" => {
             let v = wb_config::fingerprint_samples_get()?;
@@ -895,6 +901,30 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let preview = opt_arg(&args, "preview")?.unwrap_or_default();
             qoder::qoder_session_detail_query(state, date, uid, session_id, preview)
                 .and_then(to_json)
+        }
+        // Custom 池会话明细（移植 main c2464e3 / issue #149）：custom_sessions 本地流水
+        // 读时聚合；参数键 snake_case，经 tauri.ts toSnakeKey 统一转换后桥接
+        "custom_sessions_query" => {
+            let start = arg(&args, "start")?;
+            let end = arg(&args, "end")?;
+            let model = opt_arg(&args, "model")?;
+            let user_id = opt_arg(&args, "user_id")?;
+            let page = opt_arg(&args, "page")?;
+            let page_size = opt_arg(&args, "page_size")?;
+            aiwork_core::commands::custom::custom_sessions_query(
+                state, start, end, model, user_id, page, page_size,
+            )
+            .and_then(to_json)
+        }
+        "custom_session_detail_query" => {
+            let date = arg(&args, "date")?;
+            let uid = arg(&args, "uid")?;
+            let session_id = opt_arg(&args, "session_id")?.unwrap_or_default();
+            let preview = opt_arg(&args, "preview")?.unwrap_or_default();
+            aiwork_core::commands::custom::custom_session_detail_query(
+                state, date, uid, session_id, preview,
+            )
+            .and_then(to_json)
         }
 
         // ==================== scheduler（调度器） ====================
