@@ -188,7 +188,7 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 - LLM 上游请求 ureq 直连，不读系统/环境代理（容器内行为确定）。
 - 调度按本地时间 HH:MM 触发，容器需 `TZ=Asia/Shanghai`。
 - **客户端身份为实例级唯一**（`api_pool.json.trae_ide_legacy`）：`false`（默认）= Trae CN IDE 真实身份 `3.4.4 / 344 / solo_agent`，`true` = 旧 SOLO 线 `0.1.50 / 20260811 / solo_work_lite`。禁止按 uid 分流——同一台机器对不同账号声称不同版本本身就是风控信号。
-- **版本码有两个口径，不可混用**：`x-app-version-code`/TTNet = `344`（manifest `ahaNet.ttnet_params.version_code`）；`x-ide-version-code` = `20260212`（客户端内置 domain config，2026-10-26 ai-completion 日志实证）。`x-app-version` 固定 `default`（domain config `api.appVersion`）。
+- **版本码有两个口径，不可混用**：`x-app-version-code`/TTNet = `344`（manifest `ahaNet.ttnet_params.version_code`）；`x-ide-version-code` = `20260924`（上游模型目录灰度闸值；本机客户端自报的是 `20260212`，但该值命中上游旧代际分支只返回 70 个旧配置，2026-10-27 单变量消融实证 `20260924` 返回 92 项含全部当代模型）。`x-app-version` 固定 `default`（domain config `api.appVersion`）。换代用 `TRAE_IDE_VERSION_CODE` 覆盖，无需发版。
 - **设备指纹单一来源** `trae_identity::ClientProfile`：`os_name=windows`、`os_version=Windows 10 Pro`、`device_model=INVALID`、`device_manufacturer=LENOVO`、`cpu=Intel`（本机 WMI/注册表 + `os.version()` 实测，环境变量可覆盖）。推理头、模型同步、登录 URL、ExchangeToken DeviceInfo 四路必须同源，禁止各调用点自行硬编码。
 - **实机环境为设备池 + 账号级绑定**（UI「实机环境」页签，`scripts/export-trae-profile.ps1|.py` 导出）：kv `client_profile_pool`（`Vec<ImportedProfile>`，按 `device_id` 去重）/ `client_profile_creds`（`HashMap<device_id, DeviceCredential>`）/ `client_profile_bindings`（`HashMap<uid, device_id>`）。导入只入池、**不自动绑定任何账号**；绑定由用户在页签里按账号选择。
   - 设备选取三级：`device_map` 条目 → `trae_identity::bound_device(uid)` → `derive_device(uid)`。**未绑定账号一律走派生/合成身份，禁止复用已绑定的真机**——多账号共用一台设备是上游风控的典型特征。

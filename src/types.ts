@@ -1410,7 +1410,7 @@ export interface ClientProfilePoolView {
     app_version: string;
     build_version: string;
     version_code: string;
-    /** IDE 侧版本码（x-ide-version-code），真机实证 20260212，与 version_code 不同口径 */
+    /** IDE 侧版本码（x-ide-version-code），上游模型目录灰度闸值 20260924，与 version_code 不同口径 */
     ide_version_code: string;
     package_type: string;
     app_id: string;

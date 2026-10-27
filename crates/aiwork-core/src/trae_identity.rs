@@ -15,9 +15,18 @@ const DEFAULT_BUILD_VERSION: &str = "2.3.93438";
 /// TTNet 侧版本码（manifest.ahaNet.ttnet_params.version_code），如 "344"
 const DEFAULT_VERSION_CODE: &str = "344";
 /// IDE 侧版本码（x-ide-version-code，取自客户端内置 domain config `versionCode`）。
-/// 2026-10-26 本机 ai-completion 日志实证：`x-ide-version-code: "20260212"`；
-/// 注意它与 TTNet 的 "344"、TTNet 计算出的 "3004004" 是三个不同的口径。
-const DEFAULT_IDE_VERSION_CODE: &str = "20260212";
+/// 注意它与 TTNet 的 "344"、TTNet 计算出的 "3004009" 是不同口径，不可混用
+/// （2026-10-27 实测：把本值填成 TTNet 码 3004009 时，上游
+/// `batch_get_detail_param` 只返回 9 项配置）。
+///
+/// 取值是**上游模型灰度闸值**，不是客户端自报值的简单复刻：
+/// 本机 Trae CN 3.4.9 实际发送 `20260212`（2026-10-26 ai-completion 日志
+/// 96 次出现实证），但该代际在上游命中旧模型分支——同 JWT、同请求体、仅改本头
+/// 的单变量消融（2026-10-27）：`20260212` → 70 个唯一 config_name，不含任何
+/// 当代模型；`20260811` → 91 项；`20260924` → 92 项（含 glm-5.3 / kimi-k3 /
+/// mimo-v2.6 / step-5-preview / qwen3.8-max 等）。故取当代代际以获得完整目录。
+/// 上游换代时用 TRAE_IDE_VERSION_CODE 覆盖，无需发版。
+const DEFAULT_IDE_VERSION_CODE: &str = "20260924";
 const DEFAULT_PACKAGE_TYPE: &str = "stable_cn";
 const DEFAULT_APP_ID: &str = "787976";
 /// IDE 线请求来源标识（客户端 GetUserInfo 自报值）
@@ -32,7 +41,7 @@ pub struct TraeIdentity {
     pub build_version: String,
     /// 版本号（数字递增），如 "344"；注意与 SOLO 线的日期格式不同
     pub version_code: String,
-    /// IDE 侧版本码（x-ide-version-code），如 "20260212"
+    /// IDE 侧版本码（x-ide-version-code），如 "20260924"
     pub ide_version_code: String,
     /// 包类型，如 "stable_cn"
     pub package_type: String,
@@ -204,7 +213,7 @@ pub fn app_id_for(uid: &str) -> &'static str {
     pick!(uid, app_id, app_id())
 }
 
-/// IDE 侧版本码（x-ide-version-code），如 "20260212"
+/// IDE 侧版本码（x-ide-version-code），如 "20260924"
 pub fn ide_version_code_for(uid: &str) -> &'static str {
     pick!(uid, ide_version_code, ide_version_code())
 }
@@ -264,7 +273,7 @@ pub fn req_source() -> &'static str {
     &identity().req_source
 }
 
-/// IDE 侧版本码（x-ide-version-code），如 "20260212"
+/// IDE 侧版本码（x-ide-version-code），如 "20260924"
 pub fn ide_version_code() -> &'static str {
     &identity().ide_version_code
 }
