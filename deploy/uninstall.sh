@@ -353,6 +353,6 @@ $( if [[ $KEEP_DATA -eq 0 ]]; then echo "  数据目录已一并删除（含 vau
 $( for d in "${REPO_DIRS[@]:-}"; do [[ -n "$d" ]] && echo "    rm -rf $d"; done; if [[ ${#REPO_DIRS[@]} -eq 0 ]]; then echo "    （无）"; fi )
 
   重新部署：
-    curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+    curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
 
 EOF

@@ -10,20 +10,20 @@
 脚本自包含，**不需要克隆仓库**，一行命令即可：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
 ```
 
 需要传参时用 `-s --` 把参数交给脚本（管道下直接跟参数会被 `bash` 当成自己的参数）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh \
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh \
   | sudo bash -s -- -y
 ```
 
 也可以先下载再执行，便于审查内容：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh
+curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh
 sudo bash install.sh
 ```
 
@@ -53,12 +53,12 @@ sudo bash install.sh --channel baremetal-docker_main   # 用 docker_main 分支�
 （二进制 + dist + VERSION 一起还原）。探活同时校验 `/health` 与根路径，避免 dist 缺失时
 出现「部署成功但页面打不开」的假成功。
 
-`--channel` 不指定时脚本会自动探测：优先 `baremetal-latest`（main 分支构建），若尚未有该渠道
-则回落到最新的 `baremetal-<分支名>`，因此在还没合并到 main 时也能直接部署。
+`--channel` 不指定时脚本会自动探测：优先 `baremetal-latest`（默认分支构建），若尚未有该渠道
+则回落到最新的 `baremetal-<分支名>`，因此在还没合并到默认分支时也能直接部署。
 
-> 用 `main` 分支的 raw 地址取脚本，但 CI 只产出 `baremetal-docker_main` 渠道时，
-> 脚本会自动回落到该渠道，无需改 URL。反之若想固定用某分支的脚本内容，
-> 把 URL 里的 `main` 换成对应分支名即可。
+> 上面的地址固定取 `docker_main` 分支的脚本，对应 CI 产出的 `baremetal-docker_main` 渠道；
+> 当前 Release 也只有该裸机渠道。若想改用默认分支（`main`）的脚本，把 URL 里的
+> `docker_main` 换成 `main` 即可——但 `main` 分支目前不含 `deploy/` 目录，raw 地址会 404。
 
 **部署机要求**：Debian 12 / x86_64 / systemd。脚本只会补装 `curl`、`tar`、`tzdata`、
 `ca-certificates`（已存在则跳过），不安装 Docker、不安装编译工具链。
@@ -70,7 +70,7 @@ sudo bash install.sh --channel baremetal-docker_main   # 用 docker_main 分支�
 
 ```bash
 # 1. 先看会删什么（dry-run，安全）
-curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/uninstall.sh
+curl -fsSLO https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/uninstall.sh
 sudo bash uninstall.sh
 
 # 2. 确认无误后执行（连数据一起删）
@@ -250,7 +250,7 @@ systemctl start aiwork-server
 
 # 升级：重新执行安装时用的同一条命令即可
 # （自动停服 → 换二进制与 dist → 重启 → 探活，失败完整回滚上一版）
-curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh \
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh \
   | sudo bash -s -- -y
 ```
 

@@ -27,7 +27,7 @@
 脚本自包含，不用克隆仓库，一行命令即可：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
 ```
 
 需要传参时用 `-s --`（管道下参数会被 `bash` 当成自己的）：`... | sudo bash -s -- -y`。
@@ -100,7 +100,7 @@ npm run test                 # 前端单测
 
 ## 从桌面版迁移 / 老版本说明
 
-- **Web 版（本仓库 main 分支，v1.0.0+）**：桌面壳（Tauri/托盘/登录态切换/豆包/MITM 代理/设备标识重置/计划任务）已整体退役，改为服务器常驻 + 浏览器访问。
+- **Web 版（本仓库 docker_main 分支，v1.0.0+）**：桌面壳（Tauri/托盘/登录态切换/豆包/MITM 代理/设备标识重置/计划任务）已整体退役，改为服务器常驻 + 浏览器访问。
 - **桌面版数据迁移**：桌面版 → 账号管理 → 导出 JSON → Web 版 → 账号管理 → 导入（WorkBuddy 账号同理）；桌面版 vault 快照（DPAPI 加密）不可迁移，详见 [server-deploy.md](docs/server-deploy.md) 迁移章节。
 - **原「Trae Work 助手」产品（2.x）**：在 `trae_work_main` 分支维护，仅支持 Trae Work 单应用，仅必要修复。
 

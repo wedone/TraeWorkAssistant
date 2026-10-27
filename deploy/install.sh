@@ -4,7 +4,7 @@
 #
 # 用法（需 root；脚本自包含，不依赖仓库其他文件）：
 #   # 方式 A：直接下载执行，无需克隆仓库
-#   curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
 #
 #   # 方式 B：克隆后本地执行
 #   sudo bash deploy/install.sh              # 交互式，所有参数都有默认值（回车即用）
@@ -27,7 +27,7 @@ DEFAULT_CHANNEL="baremetal-latest"
 DEFAULT_INSTALL_DIR="/opt/aiwork"
 DEFAULT_DATA_DIR="/var/lib/aiwork"
 DEFAULT_USER="aiwork"
-DEFAULT_PORT="8080"
+DEFAULT_PORT="8383"
 DEFAULT_TZ="Asia/Shanghai"
 ENV_FILE="/etc/aiwork/aiwork.env"
 UNIT_FILE="/etc/systemd/system/aiwork-server.service"
@@ -60,7 +60,7 @@ usage() {
 用法: install.sh [选项]
 
 直接执行（无需克隆仓库）:
-  curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
   curl -fsSL .../deploy/install.sh | sudo bash -s -- -y        # 传参需用 -s --
 
   -y, --yes              全部使用默认值，不交互
@@ -70,7 +70,7 @@ usage() {
       --install-dir <目录> 程序目录（默认 /opt/aiwork）
       --data-dir <目录>    数据目录（默认 /var/lib/aiwork）
       --user <用户名>      运行用户（默认 aiwork）
-      --port <端口>        监听端口（默认 8080）
+      --port <端口>        监听端口（默认 8383）
       --tz <时区>          时区（默认 Asia/Shanghai）
       --force-reset-vault 允许在「已有加密凭据但密钥丢失」时继续（会废弃存量凭据）
   -h, --help             显示本帮助
@@ -646,7 +646,7 @@ ${c_ok}════════════════════ 部署完成
     systemctl start ${SERVICE}
 
   升级：重新执行本次使用的同一条命令即可（数据与密钥原样保留）
-    curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/main/deploy/install.sh | sudo bash
+    curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_main/deploy/install.sh | sudo bash
     # 若已把脚本下载到本机，也可直接：sudo bash install.sh
 
 EOF
