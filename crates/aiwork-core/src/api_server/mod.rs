@@ -58,8 +58,9 @@ pub fn ide_version(uid: &str) -> &'static str {
         crate::trae_identity::app_version_for(uid)
     }
 }
-/// IDE 侧版本码（x-ide-version-code）：2026-10-26 本机 ai-completion 日志实证值
-/// `20260212`，取自客户端内置 domain config；与 TTNet 的 `344` 不是同一口径。
+/// IDE 侧版本码（x-ide-version-code）：取值是上游模型目录的灰度闸值，由
+/// `trae_identity` 统一提供（默认 `20260924`，见该常量注释的 2026-10-27 实测）。
+/// 注意与 TTNet 的 `344` 不是同一口径。
 pub fn ide_version_code(uid: &str) -> &'static str {
     if trae_ide_legacy() {
         LEGACY_IDE_VERSION_CODE
