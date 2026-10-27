@@ -14,17 +14,26 @@ const DEFAULT_APP_VERSION: &str = "3.4.4";
 const DEFAULT_BUILD_VERSION: &str = "2.3.93438";
 /// TTNet 侧版本码（manifest.ahaNet.ttnet_params.version_code），如 "344"
 const DEFAULT_VERSION_CODE: &str = "344";
-/// IDE 侧版本码（x-ide-version-code，取自客户端内置 domain config `versionCode`）。
-/// 注意它与 TTNet 的 "344"、TTNet 计算出的 "3004009" 是不同口径，不可混用
-/// （2026-10-27 实测：把本值填成 TTNet 码 3004009 时，上游
-/// `batch_get_detail_param` 只返回 9 项配置）。
+/// IDE 侧版本码（`x-ide-version-code`），定位是**上游模型目录的灰度闸值**，
+/// 不是客户端自报值的复刻，也不是产品版本号。与 TTNet 的 "344"、TTNet 计算出的
+/// "3004009" 是不同口径，不可混用（填 3004009 时上游 `batch_get_detail_param`
+/// 只返回 9 项配置）。
 ///
-/// 取值是**上游模型灰度闸值**，不是客户端自报值的简单复刻：
-/// 本机 Trae CN 3.4.9 实际发送 `20260212`（2026-10-26 ai-completion 日志
-/// 96 次出现实证），但该代际在上游命中旧模型分支——同 JWT、同请求体、仅改本头
-/// 的单变量消融（2026-10-27）：`20260212` → 70 个唯一 config_name，不含任何
-/// 当代模型；`20260811` → 91 项；`20260924` → 92 项（含 glm-5.3 / kimi-k3 /
-/// mimo-v2.6 / step-5-preview / qwen3.8-max 等）。故取当代代际以获得完整目录。
+/// 2026-10-27 全盘取证 + 单变量消融（同 JWT / 同设备 / 同请求体，仅改本值）：
+/// - 真机默认**不发**该头：IDE 侧唯一入口 `getVersionCode()` 只读设置项
+///   `ai_assistant.request.version_code` 且无兜底，本机 `settings.json` 未设该键；
+/// - 不发 / 空串 → 9 项，且 code_reviewer、code_review_summary、refactor、
+///   solo_agent 四个函数配置为空（上游退回旧代际）；
+/// - 安装包内真实存在的三个值：`20250325`（product.json `traeVersionCode`，仅用于
+///   dynamicConfig 查询）→ 9 项；`20260212`（ai-completion 扩展自报）→ 70 项；
+///   `20260625`（solo-lite 语音模块）→ 77 项；
+/// - `20260924` → 92 项：覆盖真机 `state.vscdb` 缓存中 41 个官方模型
+///   （config_source=1）里的 38 个，为各取值最高；缺的 3 个
+///   （Doubao-Seed-2.0-Code / kimi-k2.5 / glm-5v-turbo）属更老型号，按真机目录不回补。
+///
+/// AB 参数不是开关：`ab_force_vids` / `ab_autotest_advanced_mode` 取 IDE 设置
+/// `AI.chat.*`（本机未设），`ttnet_abtest` 仅用于埋点，`BatchGetConfigDetail`
+/// 在 IDE 侧无调用点。故本值用于补齐请求上下文，取得与真机一致的当代目录。
 /// 上游换代时用 TRAE_IDE_VERSION_CODE 覆盖，无需发版。
 const DEFAULT_IDE_VERSION_CODE: &str = "20260924";
 const DEFAULT_PACKAGE_TYPE: &str = "stable_cn";
