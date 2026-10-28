@@ -35,6 +35,12 @@ pub struct NotifyConfig {
     /// 通用 webhook 地址（POST JSON：event/title/body/ts）
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// WxPusher appToken（wxpusher.zjiecode.com 后台创建应用获取）
+    #[serde(default)]
+    pub wxpusher_app_token: Option<String>,
+    /// WxPusher 收件 UID（公众号「我的」查询，多个用英文逗号分隔）
+    #[serde(default)]
+    pub wxpusher_uids: Option<String>,
     /// 签到完成时通知（默认开）
     #[serde(default = "default_true")]
     pub on_checkin_done: bool,
@@ -55,6 +61,8 @@ impl Default for NotifyConfig {
             bark_url: None,
             serverchan_sendkey: None,
             webhook_url: None,
+            wxpusher_app_token: None,
+            wxpusher_uids: None,
             on_checkin_done: true,
             on_task_failed: true,
         }
@@ -143,8 +151,25 @@ fn push(st: &AppState, cfg: &NotifyConfig, title: &str, body: &str, event: &str)
         None => Value::Null,
     };
 
+    // WxPusher：官方 API POST JSON {appToken, content, summary, contentType, uids}
+    // 业务失败也返回 HTTP 200，须解析响应体 code==1000 才算成功
+    let wxpusher = match (
+        cfg.wxpusher_app_token.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        cfg.wxpusher_uids.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(token), Some(uids)) => {
+            let r = send_wxpusher(st, event, &agent, token, uids, title, body);
+            sent |= r.is_ok();
+            match r {
+                Ok(()) => json!("ok"),
+                Err(e) => json!(e),
+            }
+        }
+        _ => Value::Null,
+    };
+
     if sent {
-        json!({ "sent": true, "bark": bark, "serverchan": serverchan, "webhook": webhook })
+        json!({ "sent": true, "bark": bark, "serverchan": serverchan, "webhook": webhook, "wxpusher": wxpusher })
     } else {
         json!({
             "sent": false,
@@ -152,8 +177,65 @@ fn push(st: &AppState, cfg: &NotifyConfig, title: &str, body: &str, event: &str)
             "bark": bark,
             "serverchan": serverchan,
             "webhook": webhook,
+            "wxpusher": wxpusher,
         })
     }
+}
+
+/// WxPusher 发送（官方 /api/send/message；HTTP 200 不代表成功，以响应体 code==1000 为准）
+fn send_wxpusher(
+    st: &AppState,
+    event: &str,
+    agent: &ureq::Agent,
+    token: &str,
+    uids_raw: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    let uid_list: Vec<&str> = uids_raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if uid_list.is_empty() {
+        return Err("WxPusher UID 为空".into());
+    }
+    let result = match agent
+        .post("https://wxpusher.zjiecode.com/api/send/message")
+        .set("Content-Type", "application/json")
+        .send_string(
+            &json!({
+                "appToken": token,
+                "content": format!("{title}\n\n{body}"),
+                "summary": truncate_chars(title, 20),
+                "contentType": 1,
+                "uids": uid_list,
+            })
+            .to_string(),
+        ) {
+        Err(e) => Err(e.to_string()),
+        Ok(resp) => match resp.into_string() {
+            Err(e) => Err(e.to_string()),
+            Ok(text) => {
+                let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                match v.get("code").and_then(Value::as_i64) {
+                    Some(1000) => Ok(()),
+                    _ => Err(v
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("响应无 code:1000")
+                        .to_string()),
+                }
+            }
+        },
+    };
+    let msg = match &result {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.clone(),
+    };
+    crate::fs_utils::app_log(&st.data_dir, &format!("[通知] {event}/wxpusher: {msg}"));
+    result
+}
+
+/// UTF-8 安全截断（按字符数），WxPusher 摘要限 20 字符
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 /// 渠道发送结果 → 前端可读字符串（"ok" / "HTTP 500" / 传输错误详情）

@@ -302,7 +302,7 @@ export interface FingerprintSample {
   note: string;
 }
 
-/** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook，独立 kv） */
+/** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook / WxPusher，独立 kv） */
 export interface NotifyConfig {
   /** 总开关：关闭时一切通知静默 */
   enabled: boolean;
@@ -312,6 +312,10 @@ export interface NotifyConfig {
   serverchan_sendkey: string | null;
   /** 通用 webhook 地址（POST JSON），null = 未配置 */
   webhook_url: string | null;
+  /** WxPusher appToken（后台创建应用获取），null = 未配置 */
+  wxpusher_app_token: string | null;
+  /** WxPusher 收件 UID，多个用英文逗号分隔，null = 未配置 */
+  wxpusher_uids: string | null;
   /** 签到完成时通知 */
   on_checkin_done: boolean;
   /** 调度任务失败时通知 */
@@ -353,6 +357,7 @@ export interface NotifyResult {
   bark: string | null;
   serverchan: string | null;
   webhook: string | null;
+  wxpusher: string | null;
 }
 
 /** 调度任务状态项（scheduler_status）：任务定义 + 最近一次执行情况 */

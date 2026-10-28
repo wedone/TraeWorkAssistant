@@ -230,7 +230,7 @@ export default function GeneralSettingsPanel() {
         toast('success', '测试通知已发送，请查收');
       } else {
         // 汇总各渠道失败原因；全部 null 视为未配置
-        const fails = [res.bark, res.serverchan, res.webhook].filter(
+        const fails = [res.bark, res.serverchan, res.webhook, res.wxpusher].filter(
           (x): x is string => !!x && x !== 'ok',
         );
         toast('error', fails.length ? `发送失败：${fails.join('；')}` : res.reason ?? '未配置任何通知渠道');
@@ -488,7 +488,8 @@ export default function GeneralSettingsPanel() {
             </button>
           </div>
           <p className="mb-3 text-xs text-slate-400">
-            签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，Trae 与 Buddy 全平台共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
+            签到完成 / 调度任务失败时推送到手机（Bark / Server酱 / WxPusher）或自建 Webhook，Trae 与 Buddy
+            全平台共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
           </p>
           <div className="grid gap-4 text-sm md:grid-cols-2">
             <div className="space-y-3">
@@ -544,6 +545,26 @@ export default function GeneralSettingsPanel() {
                   value={notifyForm.webhook_url ?? ''}
                   onChange={(e) => setNotifyForm({ ...notifyForm, webhook_url: e.target.value || null })}
                   placeholder="https://…（POST JSON，兼容企业微信机器人等自建端）"
+                  className="input w-full"
+                />
+              </div>
+              <div>
+                <label className="label">WxPusher appToken</label>
+                <input
+                  value={notifyForm.wxpusher_app_token ?? ''}
+                  onChange={(e) =>
+                    setNotifyForm({ ...notifyForm, wxpusher_app_token: e.target.value || null })
+                  }
+                  placeholder="AT_…（wxpusher.zjiecode.com 后台创建应用获取）"
+                  className="input w-full"
+                />
+              </div>
+              <div>
+                <label className="label">WxPusher UID（多个用英文逗号分隔）</label>
+                <input
+                  value={notifyForm.wxpusher_uids ?? ''}
+                  onChange={(e) => setNotifyForm({ ...notifyForm, wxpusher_uids: e.target.value || null })}
+                  placeholder="UID_…（公众号「wxpusher」→ 我的 → 我的 UID）"
                   className="input w-full"
                 />
               </div>
