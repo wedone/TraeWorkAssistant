@@ -99,6 +99,7 @@ function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
     stream_requests: a.stream_requests + b.stream_requests,
     prompt_tokens: a.prompt_tokens + b.prompt_tokens,
     completion_tokens: a.completion_tokens + b.completion_tokens,
+    cached_tokens: (a.cached_tokens ?? 0) + (b.cached_tokens ?? 0),
     credits: a.credits + b.credits,
     original_credits: a.original_credits + b.original_credits,
     avg_duration_ms:
@@ -107,6 +108,7 @@ function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
             (a.avg_duration_ms * a.total_requests + b.avg_duration_ms * b.total_requests) / total,
           )
         : 0,
+    p50_duration_ms: maxOpt(a.p50_duration_ms, b.p50_duration_ms),
     p95_duration_ms: maxOpt(a.p95_duration_ms, b.p95_duration_ms),
     max_duration_ms: maxOpt(a.max_duration_ms, b.max_duration_ms),
     avg_ttfb_ms: avgTtfb,
@@ -242,6 +244,9 @@ export default function UsageStatsPanel() {
   const [sessError, setSessError] = useState<string | null>(null);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<UsageSessionView[] | null>(null);
+  // 明细加载失败独立错误态（审查 M-B2）：失败静默归空会被误读为「无请求级明细」，
+  // 对齐列表侧 sessError「失败不得伪装成空数据」口径
+  const [detailError, setDetailError] = useState(false);
   const sessSeqRef = useRef(0);
   // 明细请求序号守卫（对齐 SessionsTab）：快速切换展开行时旧响应可能后到，
   // 仅最新一次请求可写明细态
@@ -252,11 +257,18 @@ export default function UsageStatsPanel() {
     setSessLoading(true);
     try {
       const end = localDateStr(new Date());
-      const start = localDateStr(new Date(Date.now() - (d - 1) * 86_400_000));
+      // 起点用日历回退（setDate）而非毫秒减法：跨 DST 边界时 86400000*d 不等于
+      // d 个自然日，毫秒偏移会把起点错推一天
+      const startDt = new Date();
+      startDt.setDate(startDt.getDate() - (d - 1));
+      const start = localDateStr(startDt);
       const r = await api.apiServer.customSessionsQuery({ start, end, page: p, pageSize: 20 });
       if (seq === sessSeqRef.current) {
         setSessData(r);
         setSessError(null);
+        // 后端对越界页夹取后回写实际页码（审查 Low）：否则分页器停留在
+        // 越界页，展示与数据错位（回写触发一次收敛性重取）
+        if (r.page !== p) setSessPage(r.page);
       }
     } catch (err) {
       if (seq === sessSeqRef.current) {
@@ -274,6 +286,7 @@ export default function UsageStatsPanel() {
     detailSeqRef.current++;
     setExpandedKey(null);
     setDetail(null);
+    setDetailError(false);
   };
 
   // 展开会话看各轮：session_id = conversation_key 精确匹配（后端 LIMIT 500）
@@ -286,6 +299,7 @@ export default function UsageStatsPanel() {
     const seq = ++detailSeqRef.current;
     setExpandedKey(key);
     setDetail(null);
+    setDetailError(false);
     void api.apiServer
       .customSessionDetail({
         date: r.date,
@@ -299,7 +313,8 @@ export default function UsageStatsPanel() {
       })
       .catch(() => {
         if (seq !== detailSeqRef.current) return;
-        setDetail([]);
+        setDetail(null);
+        setDetailError(true);
       });
   };
 
@@ -334,6 +349,9 @@ export default function UsageStatsPanel() {
           const e = modelLatency.get(m.model);
           if (e) {
             e.samples += m.samples;
+            // M4 回归收口：p50 与 p95 同口径归并——此前漏合并导致跨天聚合后
+            // P50 列停留在最早一天的陈旧值（样本数却是全期累计）
+            e.p50_duration_ms = maxOpt(e.p50_duration_ms, m.p50_duration_ms);
             e.p95_duration_ms = maxOpt(e.p95_duration_ms, m.p95_duration_ms);
             e.max_duration_ms = maxOpt(e.max_duration_ms, m.max_duration_ms);
             e.avg_ttfb_ms = maxOpt(e.avg_ttfb_ms, m.avg_ttfb_ms);
@@ -697,7 +715,11 @@ export default function UsageStatsPanel() {
                         {open && (
                           <tr className="border-b border-slate-100 bg-slate-50/60 dark:border-zinc-800 dark:bg-zinc-800/20">
                             <td colSpan={6} className="px-2 py-2">
-                              {detail === null ? (
+                              {detailError ? (
+                                <p className="py-1 text-center text-xs text-rose-600 dark:text-rose-400">
+                                  明细加载失败，请点击该行重试
+                                </p>
+                              ) : detail === null ? (
                                 <p className="py-1 text-center text-xs text-slate-400">加载明细中…</p>
                               ) : detail.length === 0 ? (
                                 <p className="py-1 text-center text-xs text-slate-400">无请求级明细</p>

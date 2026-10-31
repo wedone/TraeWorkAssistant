@@ -124,6 +124,17 @@ pub const TOKEN_SENSITIVE_KEYS: [&str; 4] = [
     "refreshToken",
 ];
 
+/// vault 条目防御性归一：旧条目损坏为非对象（String/Array 等）时 `entry["k"]=...`
+/// index 赋值会 panic——panic 点在续期/导入/OAuth 回写路径上（release
+/// panic=abort 直接击穿进程），归零重建。wb 主路径与 _in 参数化版同口径。
+fn normalize_vault_entry(entry: Value) -> Value {
+    if entry.is_object() {
+        entry
+    } else {
+        serde_json::json!({})
+    }
+}
+
 /// DB 读取 + vault 回填（仅内存，不落明文）：敏感字段为占位空串时从 vault 回填。
 /// vault 不可用 / 无记录 → 保持空串（上层按 no_credential 处理，fail-secure）。
 pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
@@ -167,7 +178,9 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
 }
 
 /// 单账号 UPSERT + 敏感字段 vault 收敛：非空敏感值字段级合并写入 vault（不丢旧值），
-/// DB 记录一律占位（空串）。vault 写失败时仍落占位行并返回 Err（禁止明文落库）。
+/// DB 记录一律占位（空串）。vault 写失败时**数据库保持原状**（issue #153 修复 1：
+/// 原「落占位行 + 返 Err」会销毁 DB 中未收敛的明文凭证，迁移场景无处恢复）——
+/// 不落库直接返回 Err，凭据仅存内存，重新登录可恢复。
 pub fn token_store_upsert_secure(
     data_dir: &std::path::Path,
     id: &str,
@@ -191,29 +204,36 @@ pub fn token_store_upsert_secure(
             rt = v.to_string();
         }
     }
-    let vault_result = if acc.is_empty() && rt.is_empty() {
-        Ok(())
-    } else {
-        let mut entry = crate::vault::ns_get(data_dir, "wb", id)
-            .unwrap_or_else(|| serde_json::json!({}));
-        if !acc.is_empty() {
-            entry["access_token"] = serde_json::json!(acc);
-        }
-        if !rt.is_empty() {
-            entry["refresh_token"] = serde_json::json!(rt);
-        }
-        crate::vault::ns_set(data_dir, "wb", id, &entry)
-    };
-    // 无论 vault 成败，DB 一律占位
+    if acc.is_empty() && rt.is_empty() {
+        // 无敏感值：直接落库（rec 保持调用方形态）
+        return crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec);
+    }
+    let mut entry = crate::vault::ns_get(data_dir, "wb", id).unwrap_or_else(|| serde_json::json!({}));
+    // vault 旧条目损坏为非对象（String/Array 等）时 index 赋值会 panic——
+    // panic 点在续期/导入/OAuth 回写路径上（release panic=abort 直接击穿
+    // 进程），防御性归零重建（与 _in 参数化版同口径）
+    entry = normalize_vault_entry(entry);
+    if !acc.is_empty() {
+        entry["access_token"] = serde_json::json!(acc);
+    }
+    if !rt.is_empty() {
+        entry["refresh_token"] = serde_json::json!(rt);
+    }
+    // vault 写失败：数据库保持原状，不落库（issue #153 修复 1）
+    if let Err(e) = crate::vault::ns_set(data_dir, "wb", id, &entry) {
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("[wb] vault 写入失败，token store 未落库（id={id}，凭据未持久化）: {e}"),
+        );
+        return Err(format!("WB 凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"));
+    }
+    // vault 已持久化 → DB 占位落库（明文唯一驻留地是 vault）
     for k in TOKEN_SENSITIVE_KEYS {
         if rm.contains_key(k) {
             rm.insert(k.to_string(), serde_json::json!(""));
         }
     }
-    crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec)?;
-    vault_result.map_err(|e| {
-        format!("WB 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
-    })
+    crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec)
 }
 
 // ── buddy-ai（国际版）token store：独立表 + 独立 vault 命名空间 ──────────────
@@ -250,9 +270,11 @@ fn token_store_load_secure_in(data_dir: &std::path::Path, table: &str, ns: &str)
             } else {
                 has_refresh_key = true;
             }
-            if !val.is_empty()
-                && rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty())
-            {
+            // vault 非空值优先（与 wb 主路径 token_store_load_secure 同口径，M9
+            // 审查收口：vault 是收敛后的唯一真源，DB 非空明文只可能是迁移残留
+            // ——更旧，会遮蔽 vault 新值；两表此前口径相反，必有其一偏离语义）；
+            // vault 无值时保留 DB 原值兜底
+            if !val.is_empty() {
                 rm.insert(k.to_string(), serde_json::json!(val));
             }
         }
@@ -267,6 +289,7 @@ fn token_store_load_secure_in(data_dir: &std::path::Path, table: &str, ns: &str)
 }
 
 /// 通用 secure upsert（table + vault ns 参数化）：与 token_store_upsert_secure 同口径
+///（vault 写失败时数据库保持原状不落库，issue #153 修复 1）
 fn token_store_upsert_secure_in(
     data_dir: &std::path::Path,
     table: &str,
@@ -291,31 +314,33 @@ fn token_store_upsert_secure_in(
             rt = v.to_string();
         }
     }
-    let vault_result = if acc.is_empty() && rt.is_empty() {
-        Ok(())
-    } else {
-        let mut entry = crate::vault::ns_get(data_dir, ns, id)
-            .unwrap_or_else(|| serde_json::json!({}));
-        // vault 旧条目损坏为非对象（String/Array 等）时 index 赋值会 panic——
-        // panic 点在续期/导入/OAuth 回写路径上，防御性归零重建
-        if !entry.is_object() {
-            entry = serde_json::json!({});
-        }
-        if !acc.is_empty() {
-            entry["access_token"] = serde_json::json!(acc);
-        }
-        if !rt.is_empty() {
-            entry["refresh_token"] = serde_json::json!(rt);
-        }
-        crate::vault::ns_set(data_dir, ns, id, &entry)
-    };
+    if acc.is_empty() && rt.is_empty() {
+        return crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec);
+    }
+    let mut entry = crate::vault::ns_get(data_dir, ns, id).unwrap_or_else(|| serde_json::json!({}));
+    // vault 旧条目损坏为非对象时防御性归零重建（与 wb 主路径同口径）
+    entry = normalize_vault_entry(entry);
+    if !acc.is_empty() {
+        entry["access_token"] = serde_json::json!(acc);
+    }
+    if !rt.is_empty() {
+        entry["refresh_token"] = serde_json::json!(rt);
+    }
+    // vault 写失败：数据库保持原状，不落库（issue #153 修复 1）
+    if let Err(e) = crate::vault::ns_set(data_dir, ns, id, &entry) {
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("[{ns}] vault 写入失败，token store 未落库（id={id}，凭据未持久化）: {e}"),
+        );
+        return Err(format!("凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"));
+    }
+    // vault 已持久化 → DB 占位落库（明文唯一驻留地是 vault）
     for k in TOKEN_SENSITIVE_KEYS {
         if rm.contains_key(k) {
             rm.insert(k.to_string(), serde_json::json!(""));
         }
     }
-    crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec)?;
-    vault_result.map_err(|e| format!("凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}"))
+    crate::store::docs::token_store_upsert(&crate::store::db(data_dir), table, id, &rec)
 }
 
 /// buddy-ai token store 读取（vault 回填，仅内存不落明文）
@@ -1060,7 +1085,10 @@ pub fn dig_num(v: Option<&Value>) -> Option<f64> {
 // ── 惰性刷新（F-09/F-55，原 wb_common.ensure_fresh）────────────────────────
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
-/// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/refreshed/refresh_failed。
+/// 返回 (creds, refreshed, note)，note ∈ no_credential/vault_down/fresh/
+/// expired_needs_relogin/refreshed/refresh_failed。
+/// vault_down（issue #153 修复 2）：vault 系统性故障（快照/锁/密钥）导致凭证
+/// 读出为空，与「确实无凭证」区分——暂态语义，调用方不得据此永久禁用账号。
 ///
 /// H-1（P0 修复）：「读凭证→网络刷新→落库」全程持每账号刷新锁（进程内）+ 跨进程
 /// 命名互斥体，双进程/多通道并发触发同账号刷新时串行化；持锁后重读凭证构成二次
@@ -1076,6 +1104,12 @@ pub fn ensure_fresh(
     let acct_uid = acct.get("uid").and_then(Value::as_str).unwrap_or("");
     let creds = effective_creds(state, acct_id, acct_uid);
     if creds.access_token.is_empty() {
+        // 修复 2（issue #153）：vault 系统性故障时 ns_get fail-secure 返回 None，
+        // 与「无凭证」不可区分——故障期返回暂态 vault_down，调用方按暂态处理
+        // （不永久禁用账号，故障恢复后自动自愈）
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
         return (creds, false, "no_credential");
     }
     if let Some(exp) = creds.expires_at_ms {
@@ -1098,6 +1132,9 @@ pub fn ensure_fresh(
     // 二次检查：他人已刷新落库 → 直接复用新凭证（不发网络请求）
     let creds = effective_creds(state, acct_id, acct_uid);
     if creds.access_token.is_empty() {
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
         return (creds, false, "no_credential");
     }
     if let Some(exp) = creds.expires_at_ms {
@@ -1111,7 +1148,18 @@ pub fn ensure_fresh(
         }
     }
     if let Some(new) = refresh_token_once(agent, &creds) {
-        let _ = save_token_store(state, acct_id, &new);
+        // refreshed_unsaved 口径对齐 qoder（M8 审查收口）：WB refresh token 为
+        // 一次性轮换，落库失败时新值仅在内存——旧 RT 已被服务端作废，进程重启
+        // 后账号凭证永久丢失。必须显式告警（而非静默 `let _`），否则 vault 故障
+        // 期（恰是 #153 场景）的丢凭证完全不可观测
+        if let Err(e) = save_token_store(state, acct_id, &new) {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb] refreshed_unsaved（id={acct_id}）：续期已执行但落库失败，refresh token 已轮换且仅在内存，重启后需重新续期/重新登录: {e}"
+                ),
+            );
+        }
         return (new, true, "refreshed");
     }
     (creds, false, "refresh_failed")
@@ -1147,7 +1195,16 @@ pub fn refresh_token_once_locked(
     }
     let (new, fail, detail) = refresh_token_once_ex(agent, stale);
     if let Some(n) = &new {
-        let _ = save_token_store(state, acct_id, n);
+        // refreshed_unsaved 显式告警（口径对齐 ensure_fresh，M8 审查收口）：
+        // 落库失败时新 RT 仅在内存，重启即丢——不可静默吞掉
+        if let Err(e) = save_token_store(state, acct_id, n) {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb] refreshed_unsaved（id={acct_id}）：401 自愈续期已执行但落库失败，refresh token 已轮换且仅在内存，重启后需重新续期/重新登录: {e}"
+                ),
+            );
+        }
     }
     (new, Some(fail), detail)
 }
@@ -1155,6 +1212,27 @@ pub fn refresh_token_once_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== vault 条目防御性归一（H2 回归锁） ====================
+
+    #[test]
+    fn normalize_vault_entry_rebuilds_corrupted_entry() {
+        // 损坏条目（String/Array/Null/数字）归零重建——否则 upsert 路径
+        // entry["access_token"]=... index 赋值 panic（release panic=abort）
+        for bad in [
+            serde_json::json!("legacy-string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(null),
+            serde_json::json!(42),
+        ] {
+            let fixed = normalize_vault_entry(bad);
+            assert!(fixed.is_object(), "非对象条目必须归一为对象");
+            assert!(fixed.as_object().unwrap().is_empty());
+        }
+        // 正常对象原样保留（不丢已存字段——upsert 依赖其做字段级合并）
+        let ok = serde_json::json!({"access_token": "a", "refresh_token": "r"});
+        assert_eq!(normalize_vault_entry(ok.clone()), ok);
+    }
 
     // ==================== 客户端指纹伪装（issue #48） ====================
 

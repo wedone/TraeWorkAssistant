@@ -15,7 +15,8 @@
 //!    ErrMeta 分类映射 ErrKind 后换号；
 //! 5. 流式：首字超时 10s（`open_qoder_stream`）→ QoderTranslate 翻译为标准
 //!    OpenAI chunk → `wb_sse::stream_forward_ex`（keep-alive 15s + 断连三层
-//!    检测同构）；非流式：`aggregate_qoder` → 协议投影复用 wb_sse 转换器；
+//!    检测同构）；非流式：QoderTranslate 内联 + `wb_sse::aggregate` 聚合 →
+//!    协议投影复用 wb_sse 转换器；
 //! 6. 用量记账（`record_usage_qoder` 独立 qoder 桶）+ 请求级日志。
 //!
 //! 与 wb_route 的差异（v2）：**会话粘性**（F-80-余 v2，开关默认关）与**竞速对冲**
@@ -43,7 +44,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::retry::{retry_plan, RetryAction};
 use super::wb_sse;
 use super::wb_sticky::SessionKey;
-use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
+use super::wb_upstream::{
+    lines_with_first_byte_hedged, lines_with_first_byte_timeout_tracked, new_read_err_slot,
+    ReadErrSlot, InterruptibleLines,
+};
 use super::{ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 use crate::tasks::qoder_common::QoderCreds;
@@ -376,6 +380,31 @@ fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     }
 }
 
+/// 请求体是否携带图片输入（issue #154 门控）：三协议形态统一识别——
+/// OpenAI `image_url` / Anthropic `image` / Responses `input_image`。
+/// 数组 content 递归一层（覆盖 tool_result.content 内嵌图片），字符串恒无图。
+fn body_has_image(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|m| m.get("content").is_some_and(content_has_image))
+        })
+}
+
+fn content_has_image(content: &Value) -> bool {
+    match content {
+        Value::Array(items) => items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("image_url") | Some("image") | Some("input_image")
+            ) || item.get("content").is_some_and(content_has_image)
+        }),
+        _ => false,
+    }
+}
+
 /// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
 /// 字节落点在多字节字符内时回退到前一个边界，避免超长上游响应体
 /// 整段进入错误消息/日志
@@ -388,6 +417,25 @@ fn safe_slice(s: &str, n: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// 信封业务 400（HTTP 200 + statusCodeValue=400）且本请求下发了 context_length
+/// 覆盖 → 终局错误文案（原错误 + 清空设置指引），与 HTTP 层 Fatal 同前缀格式；
+/// 否则 None 走原有轮换。参数拒绝与账号无关：换号只会逐号复现并误冷却账号，
+/// 最终以「无健康账号」收尾吞掉可行动的指引。仅接 Unknown——排队/鉴权/额度
+/// 业务码各有既定语义，不在此劫持
+fn envelope_context_reject(entry: &Value, meta: Option<&ErrMeta>) -> Option<String> {
+    let meta = meta.filter(|m| m.kind == UpstreamKind::Unknown)?;
+    let hint = qoder_upstream::context_override_hint(entry, meta.status);
+    if hint.is_empty() {
+        return None;
+    }
+    let detail = if meta.raw.is_empty() {
+        meta.message.clone()
+    } else {
+        format!("{}: {}", meta.message, safe_slice(&meta.raw, 300))
+    };
+    Some(format!("upstream {} error: {detail}{hint}", meta.status))
 }
 
 // ==================== F-80-余 v2 慢请求竞速对冲（取号侧编排，wb_route 同构） ====================
@@ -436,6 +484,9 @@ struct QoderRaceWin {
     /// settle_qoder_hedge 据此对败者补记错误/冷却（镜像 wb_route::settle_hedge）
     primary_failed: bool,
     hedge_failed: bool,
+    /// 胜者行源读错误共享槽（issue #158 P2-2）：QoderTranslate 据此在 EOF 时
+    /// 识别传输层掐断（不补 [DONE] + 写 TransportCut ErrMeta）
+    read_slot: ReadErrSlot,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -469,7 +520,9 @@ fn race_qoder_first_byte(
     // 对冲需整包克隆 peek + 按 hedge 账号 prepare_qoder_body 重建，瞬时内存
     // 放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
     if hedge_ms == 0 || converted_len > super::routes::HEDGE_SKIP_BODY_BYTES {
-        let lines = lines_with_first_byte_timeout(primary_reader)?;
+        // P2-2：tracked 变体——行源被 Box 擦拭类型后读错误须经共享槽跨层读取
+        let read_slot = new_read_err_slot();
+        let lines = lines_with_first_byte_timeout_tracked(primary_reader, read_slot.clone())?;
         return Ok(QoderRaceWin {
             lines,
             uid: primary_uid.to_string(),
@@ -478,6 +531,7 @@ fn race_qoder_first_byte(
             session_ids: primary_session_ids.clone(),
             primary_failed: false,
             hedge_failed: false,
+            read_slot,
         });
     }
     let state2 = state.clone();
@@ -536,6 +590,7 @@ fn race_qoder_first_byte(
                 session_ids,
                 primary_failed: out.primary_failed,
                 hedge_failed: out.hedge_failed,
+                read_slot: out.read_slot,
             })
         }
         Err(()) => {
@@ -593,7 +648,15 @@ fn translate_race_lines(
     chat_id: &str,
     model: &str,
 ) -> InterruptibleLines {
-    let translated = qoder_upstream::QoderTranslate::new(win.lines, err_slot, chat_id, model);
+    // P2-2：胜者读错误槽随行源移交翻译器——EOF 伴随读错误时翻译层不补
+    // [DONE] 并写入 TransportCut ErrMeta（见 QoderTranslate::flush_finish）
+    let translated = qoder_upstream::QoderTranslate::with_read_slot(
+        win.lines,
+        err_slot,
+        Some(win.read_slot),
+        chat_id,
+        model,
+    );
     InterruptibleLines::from_iterator(Box::new(translated))
 }
 
@@ -700,6 +763,18 @@ fn run_qoder_stream(
         send_stream_error(tx, proto, 404, &msg);
         return;
     }
+    // issue #154 图片门控：Qoder 上游是 agent 信封，图片走独立 image_urls 上传
+    // 通道（本项目未接线），messages 里的图片块上游读不到——与其静默丢图
+    //（F-63 红线：能力缺失必须明示），不如执行入口直接 400 拒绝
+    if body_has_image(&peek) {
+        let msg = "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型";
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 400, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 400, &msg);
+        return;
+    }
     let model_key = entry
         .get("upstreamKey")
         .and_then(Value::as_str)
@@ -721,6 +796,11 @@ fn run_qoder_stream(
             state
                 .qoder_flash_free_rate
                 .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Qoder 页单模型上下文长度 → parameters.context_length（未设置不下发）
+        qoder_upstream::apply_context_override(
+            &mut e,
+            super::context_window::qoder_target(&state.data_dir, model),
         );
         e
     };
@@ -777,8 +857,34 @@ fn run_qoder_stream(
             })
     });
 
+    // ── issue #158 P1-1：Qoder 池请求侧正向改写（sanitize+模板+工具别名）──
+    // 池级开关默认开，UI「指纹清洗」tab 热切换；模板/别名表与 Trae 池共用
+    // 同一份配置（wb_template_map.json / 工具别名规则）
+    let sanitize = state.qoder_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+    let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+    let tool_alias_rules =
+        super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
+    let mut last_residual_note: Option<String> = None;
+    // 会话稳定种子（与 Trae 的 now_ts 不同）：Qoder 的 session_seed 兜底走
+    // first_user_fingerprint(messages)——清洗文本必须跨请求一致，否则同会话
+    // 每请求派生不同上游 session，破坏会话延续与缓存复用。种子从粘性键派生
+    // （SessionKey 派生 Debug），同会话恒定
+    let seed_base = format!("q#{:?}", sticky_key);
+
     let mut tried: HashSet<String> = HashSet::new();
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // issue #156：轮换总预算 deadline（45s）。首字超时 10s×N 账号的逐号轮换
+    // 会拖过客户端 60s 读超时窗口——TRAE 不等终局错误直接报
+    // "Timeout after 60000ms (4028)"（issue 贴图），用户只见超时不见原因。
+    // 预算内正常轮换不受影响；超预算立即按 exhaust 语义收尾，把「换号重演」
+    // 变成「可读错误必达」（配合 hard_credit_stats 文案携带积分耗尽提示）
+    let rotate_deadline = Instant::now() + Duration::from_secs(45);
+    // M2 审查修复：本请求内已记入模型级 Server 冷却的标记。冷却早退检查针对
+    // 的是「并发请求刚记入的窗口」（避免 N 账号逐个硬打已知故障上游）；若不
+    // 区分，本请求给首账号记的冷却会在下一轮循环顶立即命中——单次瞬时 5xx/
+    // 首字超时即终结整轮轮换，其余账号一次不试。置位后本请求内放行（仍受
+    // 45s 预算约束），后续请求照常快速失败
+    let mut self_noted_server_cooldown = false;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）。
@@ -792,18 +898,62 @@ fn run_qoder_stream(
             );
             return;
         }
+        // 轮换预算检查（issue #156）：仅约束「换号再试」——首个账号（tried 空）
+        // 不受影响；超预算后不再取新号，按 exhaust 语义收尾（错误消息在下一
+        // 分支取号失败路径统一拼装，tried 非空保证healthy 统计口径正确）
+        if !tried.is_empty() && Instant::now() > rotate_deadline {
+            let duration_ms = start_ts.elapsed().as_millis() as u64;
+            state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
+            let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
+            let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
+            let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                "qoder",
+                empty_hits,
+                tried.len(),
+                healthy_total,
+                hard_credit_cnt,
+            );
+            // 模型级 Server 冷却与指纹判定同口径：空完成主导（指纹拦截）时模型
+            // 本身可用（拦的是请求指纹，换号无效），不记 Server 冷却——否则指纹
+            // 拦截被误判为模型故障，后续请求被冷却误伤且跨池回退也拦不住同指纹。
+            // 仅非指纹主导（真 5xx/超时占多数）才补记冷却，让后续请求走预检
+            // 快速失败/跨池回退，不再重演整轮轮换（issue #156）
+            if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
+                note_model_server_cooldown(model);
+            }
+            state.logger.log_request(
+                "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                duration_ms, &key_name, "", Some(&exhaust_msg),
+            );
+            // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成主导
+            // （指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步，不再从零试探
+            super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
+            let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
+            state.logger.log_debug_line(format!(
+                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                tried.len(),
+                empty_hits,
+            ));
+            // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
+            // response.failed，不再裸 data: 帧不可读）；code 保持字符串
+            // "no_healthy_account"（客户端兼容）
+            send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
+            return;
+        }
         // 模型级冷却中（并发请求刚记入窗口）：不再逐账号硬打已知故障的上游
         // （issue #90 审查修复）。此前仅跳过同号退避、仍会 break 到下一个账号发
         // 真实请求——N 账号 = N 次无效上游调用，与本条 Feature「不再每请求硬打」
         // 直接相悖。首个账号尚未尝试时不拦截（保留一次探测）。
-        if !tried.is_empty() {
+        // M2：本请求自记的冷却（self_noted_server_cooldown）不触发本早退——
+        // 放行继续轮换（受 45s 预算约束），否则首个账号瞬时故障即终结整轮。
+        if !tried.is_empty() && !self_noted_server_cooldown {
             if let Some(rem) = model_cooling_remaining_secs(model) {
                 let msg = format!("model {model} cooling down, retry after {rem}s");
-                let err_body = json!({
-                    "error": {"message": msg, "type": "rate_limit_error", "code": "model_cooldown"}
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {err_body}\n\n"))));
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                // M6 审查收口：错误帧按客户端协议分流（Anthropic event:error、
+                // Responses response.failed）——此前裸 data: 帧对这两类客户端
+                // 不可读（流静默中断），是本批「错误帧按协议分流」声明的遗漏
+                // 分支；code 保持字符串客户端兼容
+                send_stream_error_named(tx, proto, "model_cooldown", &msg);
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
                 state.logger.log_request(
                     "qoder", "POST", "/v1/chat/completions", model, true, 429, "none",
@@ -833,12 +983,21 @@ fn run_qoder_stream(
                     // wb_template_map.json），否则维持无健康账号文案；
                     // code 保持 no_healthy_account（客户端兼容）
                     let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        "qoder",
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                    );
                     state.logger.log_request(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
+                    // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成
+                    // 主导（指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步
+                    super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
                     // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
                     // （kind=empty），返回日志注记供反查漏网触发句
                     let sample_note =
@@ -848,13 +1007,8 @@ fn run_qoder_stream(
                         tried.len(),
                         empty_hits,
                     ));
-                    let err_body = json!({
-                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                    });
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {err_body}\n\n"
-                    ))));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 按客户端协议分流错误帧（同预算耗尽收尾口径）
+                    send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }
             },
@@ -925,8 +1079,43 @@ fn run_qoder_stream(
             },
         };
 
+        // ── issue #158 P1-1：active_peek（清洗副本）——原始 peek 保留给
+        // session_ctx 记账 preview 与 body_has_image；清洗+别名改写打在副本上，
+        // 供信封构造与对冲竞速共用（主/对冲指纹一致，竞速不浪费）。
+        // 激进门镜像 trae 池 routes.rs：空完成后 / 池级指纹拦截 TTL 内时全力
+        // 清洗；种子 tried.len()-1 → 首轮恒 0（会话稳定种子跨请求一致，保护
+        // session_seed 的 first_user_fingerprint 兜底），换号递增逃逸方差
+        let aggressive =
+            sanitize && (empty_hits > 0 || super::wb_payload::fp_block_recent("qoder"));
+        let mut active_peek: Value = peek.clone();
+        // 逆映射供响应侧回改（P1-2 stream_forward_ex 接线后消费）
+        let tool_alias: Option<std::collections::HashMap<String, String>>;
+        if sanitize {
+            let seed =
+                super::wb_payload::variant_seed(&seed_base, (tried.len() - 1) as u64);
+            active_peek =
+                super::payload::sanitize_openai_body(&peek, &templates, seed, aggressive);
+            tool_alias = super::wb_payload::apply_tool_alias_forward_value(
+                &mut active_peek,
+                &tool_alias_rules,
+            );
+            // 残指纹自检（issue #122 C3）：改写后首条 system 仍命中已知特征词 →
+            // debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+            if let Some(note) = super::wb_payload::residual_fingerprint_note_value(&active_peek) {
+                if last_residual_note.as_deref() != Some(note.as_str()) {
+                    last_residual_note = Some(note.clone());
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] 残指纹自检命中: {note} pool=qoder uid={}",
+                        picked.uid
+                    ));
+                }
+            }
+        } else {
+            tool_alias = None;
+        }
+
         // 请求体（agent 信封；依赖账号 uid 派生 session）
-        let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
+        let converted = match qoder_upstream::prepare_qoder_body(&active_peek, &entry, &creds.uid) {
             Ok(b) => b,
             Err(e) => {
                 state.logger.log_request(
@@ -977,7 +1166,7 @@ fn run_qoder_stream(
                         state,
                         &picked.uid,
                         reader,
-                        &peek,
+                        &active_peek,
                         &entry,
                         &model_key,
                         &model_source,
@@ -990,6 +1179,14 @@ fn run_qoder_stream(
                         Ok(w) => w,
                         Err(()) => {
                             state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                            // issue #156：首字超时补记模型级 Server 冷却。原实现只
+                            // note 账号（30min 软熔断）——后续请求仍会逐账号重演
+                            // 10s 首字等待，N 账号 = 10s×N；轮换超 60s 时 TRAE 客户
+                            // 端先报 Timeout(4028)（issue 贴图），且一次慢响应毒化
+                            // 整池。补模型级冷却后，后续请求走 dispatch 预检快速
+                            // 失败/跨池回退，不再重演整轮轮换
+                            note_model_server_cooldown(model);
+                            self_noted_server_cooldown = true; // M2：本请求自记，放行继续轮换
                             break;
                         }
                     };
@@ -1004,7 +1201,12 @@ fn run_qoder_stream(
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     // Qoder 无 namespace 展平编码（F4 移植）→ 空集合禁用编码名拆分
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, &std::collections::HashSet::new());
+                        // Qoder 无 namespace 展平编码（Responses 分支为防御性兜底，
+                        // 实际仅 OpenAi/Anthropic 可达）→ 空集合禁用编码名拆分（审查 F4）
+                        wb_sse::stream_forward_ex(
+                            ilines, tx, proto, chat_id, model, &std::collections::HashSet::new(),
+                            tool_alias.as_ref(),
+                        );
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     let meta = err_slot
                         .lock()
@@ -1048,8 +1250,45 @@ fn run_qoder_stream(
                     };
                     match error_info {
                         Some((code, msg)) => {
+                            // 信封 400 拒绝 context_length 覆盖：终局下发原错误 + 清空
+                            // 指引（不换号不冷却，同 HTTP 层 Fatal 口径）
+                            if !sent_any {
+                                if let Some(full) = envelope_context_reject(&entry, meta.as_ref()) {
+                                    record_usage(false);
+                                    state.logger.log_request_ttfb(
+                                        "qoder", "POST", "/v1/chat/completions", model, true,
+                                        400, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.qoder_pool.name_of(&win_uid), Some(&full),
+                                    );
+                                    send_stream_error(tx, proto, 400, &full);
+                                    return;
+                                }
+                            }
                             // 流内错误分类以 ErrMeta 为准（translate 写入，含排队/额度信号）
                             match meta.as_ref().map(|m| m.kind) {
+                                Some(UpstreamKind::TransportCut) => {
+                                    // 传输层掐断（issue #158 P2-2，与 Trae 池 sse.rs 同
+                                    // 口径）：账号无关的传输故障——不冷却账号/模型、
+                                    // 不解绑粘性、不计空完成指纹。未流出 → 换号（收尾
+                                    // 帧未发）；已流出 → 就地收尾落账失败（终止帧已由
+                                    // stream_forward_ex EOF-with-content 分支补发，
+                                    // 客户端看到完整流，服务端如实记失败）
+                                    if sent_any {
+                                        state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
+                                        state.record_usage_qoder(
+                                            model, &win_uid, key_id, false, true, duration_ms,
+                                            pt, ct, Some(ttfb_ms), credits, original_credits,
+                                            &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                                        );
+                                        state.logger.log_request_ttfb(
+                                            "qoder", "POST", "/v1/chat/completions", model, true,
+                                            200, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                            &state.qoder_pool.name_of(&win_uid), Some(&msg),
+                                        );
+                                        return;
+                                    }
+                                    break;
+                                }
                                 Some(UpstreamKind::Queued) => {
                                     // 排队：同号退避重试为主（对冲接管后不适用——重试
                                     // 凭证/请求体属主账号，与生效账号不一致，直接换号）；
@@ -1068,7 +1307,9 @@ fn run_qoder_stream(
                                         // 429（移植 7883d1c），不再对池内每个账号硬打
                                         // 已知故障上游（原 break 换号会轮换到耗尽，
                                         // 逐账号真实请求）
-                                        if model_cooling_remaining_secs(model).is_some() {
+                                        if model_cooling_remaining_secs(model).is_some()
+                                            && !self_noted_server_cooldown
+                                        {
                                             // 复用外层 duration_ms（与同分支其余记账同一口径）
                                             state.record_usage_qoder(
                                                 model, &win_uid, key_id, false, true,
@@ -1087,6 +1328,15 @@ fn run_qoder_stream(
                                                 &format!("model {model} cooling down, retry later"),
                                             );
                                             return;
+                                        }
+                                        // M10 审查收口：内层排队退避同样受轮换预算约束
+                                        // ——3×30s 排队退避可独自耗尽客户端读超时窗口，
+                                        // 外层预算检查永远没机会触发；超预算 break 换号
+                                        // （外层预算收尾按 exhaust 语义错误必达）
+                                        if Instant::now() + Duration::from_secs(secs as u64)
+                                            > rotate_deadline
+                                        {
+                                            break;
                                         }
                                         note_model_cooldown(model, secs);
                                         queue_same += 1;
@@ -1120,6 +1370,7 @@ fn run_qoder_stream(
                                     // 说明模型实际在服务，尾部错误帧不代表模型故障）
                                     if kind == UpstreamKind::Server && !sent_any {
                                         note_model_server_cooldown(model);
+                                        self_noted_server_cooldown = true; // M2：本请求自记
                                     }
                                     // issue #90 修复②：last_error 带模型名 + 时刻（此前只有
                                     // uid/code/msg，无法定位是哪个模型、故障从何时开始）
@@ -1128,7 +1379,7 @@ fn run_qoder_stream(
                                         win_uid,
                                         model,
                                         code,
-                                        msg,
+                                        safe_slice(&msg, 200),
                                         now_cn_timestamp()
                                     ));
                                 }
@@ -1170,6 +1421,28 @@ fn run_qoder_stream(
                                 );
                                 return;
                             }
+                            // P2-2：传输层掐断且内容已流出（翻译层 EOF 不补 [DONE] →
+                            // stream_forward_ex 视作 EOF 断流并补终止帧，error_info 为
+                            // 空，若无此检查会被当成功落账+绑粘性）——按失败落账，
+                            // 不绑粘性、不记成功、不冷却（账号无关）
+                            if matches!(
+                                meta.as_ref().map(|m| m.kind),
+                                Some(UpstreamKind::TransportCut)
+                            ) {
+                                state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
+                                state.record_usage_qoder(
+                                    model, &win_uid, key_id, false, true, duration_ms,
+                                    pt, ct, Some(ttfb_ms), credits, original_credits,
+                                    &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                                );
+                                state.logger.log_request_ttfb(
+                                    "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.qoder_pool.name_of(&win_uid),
+                                    Some("传输层掐断（内容已流出）→ 就地收尾落账失败"),
+                                );
+                                return;
+                            }
                             // 成功终局：缓存读 tokens 旁路同落（M4；0 值不入账）
                             state.record_usage_cached(super::usage::UsageBucket::Qoder, cached);
                             record_usage(true);
@@ -1198,6 +1471,13 @@ fn run_qoder_stream(
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
+                            // M10 审查收口：同号退避（最长 60s×N）受轮换预算约束，
+                            // 超预算 break 换号 → 外层预算收尾按 exhaust 语义必达
+                            if Instant::now() + Duration::from_millis(delay_ms.min(60_000) as u64)
+                                > rotate_deadline
+                            {
+                                break;
+                            }
                             // 审查修复：分段 sleep + 断连感知（原整段 sleep 最长 60s，
                             // 断连后仍空等；原 sleep 后的 is_closed 检查一并合并）
                             if !sleep_interruptible(
@@ -1231,7 +1511,9 @@ fn run_qoder_stream(
                                     .clamp(1, QUEUE_BACKOFF_MAX_SECS);
                                 // 审查修复：模型级冷却（同流内 Queued 分支）——
                                 // 冷却中直接终止轮换返回 429（移植 7883d1c），不再逐账号硬打
-                                if model_cooling_remaining_secs(model).is_some() {
+                                if model_cooling_remaining_secs(model).is_some()
+                                    && !self_noted_server_cooldown
+                                {
                                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                                     state.record_usage_qoder(
                                         model, &picked.uid, key_id, false, true,
@@ -1249,6 +1531,12 @@ fn run_qoder_stream(
                                         &format!("model {model} cooling down, retry later"),
                                     );
                                     return;
+                                }
+                                // M10：同号排队退避受轮换预算约束（同流内 Queued 分支）
+                                if Instant::now() + Duration::from_secs(secs as u64)
+                                    > rotate_deadline
+                                {
+                                    break;
                                 }
                                 note_model_cooldown(model, secs);
                                 queue_same += 1;
@@ -1270,6 +1558,7 @@ fn run_qoder_stream(
                             // 永不触发跨池回退（issue #90 主诉场景）
                             if classified.kind == UpstreamKind::Server {
                                 note_model_server_cooldown(model);
+                                self_noted_server_cooldown = true; // M2：本请求自记
                             }
                             *safe_lock(&state.last_error) = Some(format!(
                                 "qoder uid={} model={} status={} body={} at {}",
@@ -1288,8 +1577,12 @@ fn run_qoder_stream(
                             break; // 换号
                         }
                         RetryAction::Fatal => {
-                            let msg =
-                                format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            let msg = format!(
+                                "upstream {} error: {}{}",
+                                status,
+                                safe_slice(&resp_body, 300),
+                                qoder_upstream::context_override_hint(&entry, status),
+                            );
                             // 终态记账对齐「每请求一行」口径（移植 7883d1c，审查 F3）：
                             // Fatal 是请求终局（同 no-healthy 由取号分支记录），此前仅
                             // log_request 导致用量统计页缺口；ttfb/credits 无失败语义传 None
@@ -1346,6 +1639,14 @@ pub async fn qoder_aggregate_chat(
                 "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
             ));
         }
+        // issue #154：聚合路径同流式门控——Qoder 上游对图片输入 400 且报错信息
+        // 不可读，入口显式拒绝给出可行动提示（与流式路径同文案）
+        if body_has_image(&peek) {
+            return Err(
+                "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型"
+                    .to_string(),
+            );
+        }
         let model_key = entry
             .get("upstreamKey")
             .and_then(Value::as_str)
@@ -1365,6 +1666,11 @@ pub async fn qoder_aggregate_chat(
                 state
                     .qoder_flash_free_rate
                     .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // Qoder 页单模型上下文长度 → parameters.context_length（未设置不下发）
+            qoder_upstream::apply_context_override(
+                &mut e,
+                super::context_window::qoder_target(&state.data_dir, &model),
             );
             e
         };
@@ -1415,10 +1721,69 @@ pub async fn qoder_aggregate_chat(
                 })
         });
 
+        // ── issue #158 P1-1：请求侧正向改写（同 run_qoder_stream 流式路径）──
+        let sanitize = state.qoder_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let templates =
+            super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        let tool_alias_rules =
+            super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
+        let mut last_residual_note: Option<String> = None;
+        // 会话稳定种子（同流式）：从粘性键派生，同会话跨请求恒定
+        let seed_base = format!("q#{:?}", sticky_key);
+
         let mut tried: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 轮换预算（issue #156 聚合侧补齐，对齐流式路径）：聚合含「首字超时 10s × N
+        // 账号」逐号等待，无预算可拖过客户端读超时；仅约束「换号再试」（首个账号
+        // tried 空不受影响），超预算按 exhaust 语义收尾
+        let rotate_deadline = Instant::now() + Duration::from_secs(45);
+        // M2 审查修复（同流式路径）：本请求自记的模型级 Server 冷却不触发
+        // 各「冷却中终止」早退——否则首账号瞬时故障即终结整轮轮换
+        let mut self_noted_server_cooldown = false;
 
         loop {
+            // 轮换预算检查：超预算不再取新号，按 exhaust 语义收尾（与下方取号
+            // 耗尽收尾逐行同构 + log_request(503)，非流式以 return Err 透传）
+            if !tried.is_empty() && Instant::now() > rotate_deadline {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_qoder(
+                    &model, "none", &key_id, false, stream, duration_ms, 0, 0, None, None, None,
+                    &session_ctx(&peek),
+                );
+                let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
+                let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
+                let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                    "qoder",
+                    empty_hits,
+                    tried.len(),
+                    healthy_total,
+                    hard_credit_cnt,
+                );
+                // 模型级冷却与指纹判定同口径（对齐流式预算收尾）：空完成主导（指纹
+                // 拦截）时模型本身可用，不记 Server 冷却——冷却误伤且跨池回退拦不住
+                // 同指纹；仅非指纹主导（真 5xx/超时占多数）补记，后续请求预检快速失败
+                if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
+                    note_model_server_cooldown(&model);
+                }
+                // issue #158 P1：池级指纹拦截短记忆（对齐流式/trae/buddy 池）——
+                // 空完成主导（指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步
+                super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
+                let sample_note = super::wb_payload::empty_sample_note(
+                    &exhaust_tag, "qoder", &body_vec,
+                );
+                if !sample_note.is_empty() {
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                        tried.len(),
+                        empty_hits,
+                    ));
+                }
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", &model, stream, 503, "none",
+                    duration_ms, &key_name, "", Some(&exhaust_msg),
+                );
+                return Err(exhaust_msg);
+            }
             // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
             let picked = match first_pick.take() {
                 Some(p) => p,
@@ -1451,8 +1816,17 @@ pub async fn qoder_aggregate_chat(
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
-                        let (exhaust_msg, exhaust_tag) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
+                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                            "qoder",
+                            empty_hits,
+                            tried.len(),
+                            healthy_total,
+                            hard_credit_cnt,
+                        );
+                        // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成
+                        // 主导（指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步
+                        super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
                         // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
                         // （kind=empty，非流式路径无收尾 [DEBUG] 行，就地补齐；三池同口径）
                         let sample_note = super::wb_payload::empty_sample_note(
@@ -1517,10 +1891,47 @@ pub async fn qoder_aggregate_chat(
                 },
             };
 
-            let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
-                Ok(b) => b,
-                Err(e) => return Err(e),
-            };
+            // ── issue #158 P1-1：active_peek（清洗副本，同流式路径）──
+            // 原始 peek 保留给 session_ctx 记账 preview；清洗+别名改写打在副本上
+            let aggressive =
+                sanitize && (empty_hits > 0 || super::wb_payload::fp_block_recent("qoder"));
+            let mut active_peek: Value = peek.clone();
+            // 逆映射供响应侧回改（P1-2：aggregate 流式收集点消费；resp 聚合后
+            // 已是原名，闭包外 completion_to_anthropic 传 None 即可）
+            let tool_alias: Option<std::collections::HashMap<String, String>>;
+            if sanitize {
+                let seed = super::wb_payload::variant_seed(
+                    &seed_base,
+                    (tried.len() - 1) as u64,
+                );
+                active_peek = super::payload::sanitize_openai_body(
+                    &peek, &templates, seed, aggressive,
+                );
+                tool_alias = super::wb_payload::apply_tool_alias_forward_value(
+                    &mut active_peek,
+                    &tool_alias_rules,
+                );
+                // 残指纹自检（issue #122 C3）：debug 日志按请求去重
+                if let Some(note) =
+                    super::wb_payload::residual_fingerprint_note_value(&active_peek)
+                {
+                    if last_residual_note.as_deref() != Some(note.as_str()) {
+                        last_residual_note = Some(note.clone());
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] 残指纹自检命中: {note} pool=qoder uid={}",
+                            picked.uid
+                        ));
+                    }
+                }
+            } else {
+                tool_alias = None;
+            }
+
+            let converted =
+                match qoder_upstream::prepare_qoder_body(&active_peek, &entry, &creds.uid) {
+                    Ok(b) => b,
+                    Err(e) => return Err(e),
+                };
             // 审查修复 K：信封 id 在外层解析一次，内层记账复用（同流式路径）
             let envelope_ids = extract_envelope_ids(&converted);
 
@@ -1545,7 +1956,7 @@ pub async fn qoder_aggregate_chat(
                             &state,
                             &picked.uid,
                             reader,
-                            &peek,
+                            &active_peek,
                             &entry,
                             &model_key,
                             &model_source,
@@ -1558,6 +1969,12 @@ pub async fn qoder_aggregate_chat(
                             Ok(w) => w,
                             Err(()) => {
                                 state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                // issue #156 聚合侧补齐（对齐流式路径）：竞速双败
+                                // 补记模型级 Server 冷却——只 note 账号时，后续请求
+                                // 仍逐账号重演 10s 首字等待；补模型级冷却后走
+                                // dispatch 预检快速失败/跨池回退
+                                note_model_server_cooldown(&model);
+                                self_noted_server_cooldown = true; // M2：本请求自记
                                 break;
                             }
                         };
@@ -1569,12 +1986,35 @@ pub async fn qoder_aggregate_chat(
                         // G4：记账会话 id 按胜者信封落定（race 在聚合处被部分消费，先取快照）
                         let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                         // 竞速胜者原始行源 → 翻译 → 聚合（tool_calls 合并/usage 收集）；
-                        // 首字超时已在 race 内裁定，聚合阶段无失败通道
+                        // 首字超时已在 race 内裁定，聚合阶段无失败通道。
+                        // P2-2：胜者读错误槽随行源移交翻译器（EOF 掐断识别）
                         let agg_chat_id = format!("chatcmpl-{}", now_ts());
-                        let translated =
-                            qoder_upstream::QoderTranslate::new(race.lines, err_slot.clone(), &agg_chat_id, &model);
-                        let (resp, error) = wb_sse::aggregate(translated, &agg_chat_id);
+                        let translated = qoder_upstream::QoderTranslate::with_read_slot(
+                            race.lines,
+                            err_slot.clone(),
+                            Some(race.read_slot.clone()),
+                            &agg_chat_id,
+                            &model,
+                        );
+                        // P1-2：流式收集阶段按胜者尝试的别名表回改工具名（resp 已是原名）
+                        let (resp, error) =
+                            wb_sse::aggregate(translated, &agg_chat_id, tool_alias.as_ref());
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        // P2-2：传输层掐断优先于一切结果——聚合遇 EOF 掐断会返回
+                        // (Some(部分响应), None)，直接当成功交付会把截断数据（可能
+                        // 含残缺 tool_calls JSON）发给客户端；丢弃换号（非流式可安全重试）
+                        if matches!(
+                            err_slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.kind),
+                            Some(qoder_upstream::UpstreamKind::TransportCut)
+                        ) {
+                            state.logger.log_request_ttfb(
+                                "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                &state.qoder_pool.name_of(&win_uid),
+                                Some("传输层掐断（部分响应已丢弃）→ 换号重试"),
+                            );
+                            break;
+                        }
                         match (resp, error) {
                             (Some(mut r), None) => {
                                 r["model"] = json!(model);
@@ -1624,7 +2064,28 @@ pub async fn qoder_aggregate_chat(
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .clone();
+                                // 信封 400 拒绝 context_length 覆盖：终局返回原错误 +
+                                // 清空指引（同流式分支）
+                                if let Some(full) = envelope_context_reject(&entry, meta.as_ref()) {
+                                    state.record_usage_qoder(
+                                        &model, &win_uid, &key_id, false, stream, duration_ms,
+                                        0, 0, Some(ttfb_ms), None, None,
+                                        &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                                    );
+                                    state.logger.log_request_ttfb(
+                                        "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                        400, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.qoder_pool.name_of(&win_uid), Some(&full),
+                                    );
+                                    return Err(full);
+                                }
                                 match meta.as_ref().map(|m| m.kind) {
+                                    Some(UpstreamKind::TransportCut) => {
+                                        // 传输层掐断（issue #158 P2-2）：账号无关的传输
+                                        // 故障——不冷却账号/模型、不解绑粘性、不计空完成
+                                        // 指纹；下方公共收尾统一落 last_error + 日志 +
+                                        // break 换号重试
+                                    }
                                     Some(UpstreamKind::Queued) => {
                                         // 排队：同号退避重试为主（对冲接管后不适用，
                                         // 同流式路径——直接换号）；模型已在冷却中
@@ -1640,7 +2101,9 @@ pub async fn qoder_aggregate_chat(
                                             // 冷却中直接终止轮换返回 429（移植 7883d1c，
                                             // upstream 前缀借助端点状态码透传映射），
                                             // 不再逐账号硬打已知故障上游
-                                            if model_cooling_remaining_secs(&model).is_some() {
+                                            if model_cooling_remaining_secs(&model).is_some()
+                                                && !self_noted_server_cooldown
+                                            {
                                                 state.record_usage_qoder(
                                                     &model, &win_uid, &key_id, false, stream,
                                                     duration_ms, 0, 0, None, None, None,
@@ -1656,6 +2119,12 @@ pub async fn qoder_aggregate_chat(
                                                 return Err(format!(
                                                     "upstream 429 error: model {model} cooling down, retry later"
                                                 ));
+                                            }
+                                            // M10：内层排队退避受轮换预算约束（同流式路径）
+                                            if Instant::now() + Duration::from_secs(secs as u64)
+                                                > rotate_deadline
+                                            {
+                                                break;
                                             }
                                             note_model_cooldown(&model, secs);
                                             queue_same += 1;
@@ -1678,6 +2147,7 @@ pub async fn qoder_aggregate_chat(
                                         // issue #90 修复①：同流式分支（非流式无部分流出概念）
                                         if kind == UpstreamKind::Server {
                                             note_model_server_cooldown(&model);
+                                            self_noted_server_cooldown = true; // M2：本请求自记
                                         }
                                     }
                                     None => {
@@ -1689,7 +2159,7 @@ pub async fn qoder_aggregate_chat(
                                     win_uid,
                                     model,
                                     code,
-                                    msg,
+                                    safe_slice(&msg, 200),
                                     now_cn_timestamp()
                                 ));
                                 state.logger.log_request_ttfb(
@@ -1718,6 +2188,14 @@ pub async fn qoder_aggregate_chat(
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
+                                // M10 审查收口：同号退避（最长 60s×N）受轮换预算约束，
+                                // 超预算 break 换号 → 外层预算收尾按 exhaust 语义必达
+                                if Instant::now()
+                                    + Duration::from_millis(delay_ms.min(60_000) as u64)
+                                    > rotate_deadline
+                                {
+                                    break;
+                                }
                                 // 统一走 sleep_interruptible(None)：分段等待封装统一
                                 sleep_interruptible(
                                     Duration::from_millis(delay_ms.min(60_000)),
@@ -1738,8 +2216,11 @@ pub async fn qoder_aggregate_chat(
                                         .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                         .clamp(1, QUEUE_BACKOFF_MAX_SECS);
                                     // 审查修复：模型级冷却（同流式分支）——冷却中
-                                    // 直接终止轮换返回 429（移植 7883d1c），不再逐账号硬打
-                                    if model_cooling_remaining_secs(&model).is_some() {
+                                    // 直接终止轮换返回 429（移植 7883d1c），不再逐账号硬打；
+                                    // M2：本请求自记的冷却不触发本早退
+                                    if model_cooling_remaining_secs(&model).is_some()
+                                        && !self_noted_server_cooldown
+                                    {
                                         state.record_usage_qoder(&model, &picked.uid, &key_id,
                                             false, stream,
                                             start_ts.elapsed().as_millis() as u64, 0, 0,
@@ -1754,6 +2235,12 @@ pub async fn qoder_aggregate_chat(
                                         return Err(format!(
                                             "upstream 429 error: model {model} cooling down, retry later"
                                         ));
+                                    }
+                                    // M10：内层排队退避受轮换预算约束（同流式路径）
+                                    if Instant::now() + Duration::from_secs(secs as u64)
+                                        > rotate_deadline
+                                    {
+                                        break;
                                     }
                                     note_model_cooldown(&model, secs);
                                     queue_same += 1;
@@ -1772,6 +2259,7 @@ pub async fn qoder_aggregate_chat(
                                 // issue #90 修复①：同流式 HTTP 分支（5xx 换号前记模型级冷却）
                                 if classified.kind == UpstreamKind::Server {
                                     note_model_server_cooldown(&model);
+                                    self_noted_server_cooldown = true; // M2：本请求自记
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "qoder uid={} model={} status={} body={} at {}",
@@ -1808,9 +2296,10 @@ pub async fn qoder_aggregate_chat(
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
-                                    "upstream {} error: {}",
+                                    "upstream {} error: {}{}",
                                     status,
-                                    safe_slice(&resp_body, 300)
+                                    safe_slice(&resp_body, 300),
+                                    qoder_upstream::context_override_hint(&entry, status),
                                 ));
                             }
                         }
@@ -1824,10 +2313,14 @@ pub async fn qoder_aggregate_chat(
     match result {
         Ok(Ok(resp)) => {
             let body = match proto {
+                // tool_alias 传 None：resp 来自闭包内 aggregate（流式收集阶段已回改
+                // 原名，逆映射此处幂等无操作）；且 tool_alias 被 move 进
+                // spawn_blocking 闭包，作用域不可达
                 Protocol::Anthropic => wb_sse::completion_to_anthropic(
                     &resp,
                     &format!("msg_{}", now_ts()),
                     &model_out,
+                    None,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
                 Protocol::Responses => super::wb_responses::completion_to_responses(
@@ -1904,6 +2397,46 @@ fn send_stream_error(
                 "status": "failed",
                 "output": [],
                 "error": {"code": code.to_string(), "message": msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+/// 字符串 code 变体（轮换耗尽收尾专用）：错误 code 保持字符串 "no_healthy_account"
+/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。三协议分流形态同构
+/// send_stream_error；耗尽文案 exhaust_message 恒非空，空 msg 兜底用 code
+fn send_stream_error_named(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    code: &str,
+    msg: &str,
+) {
+    let msg = if msg.trim().is_empty() { code } else { msg };
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+        }
+        Protocol::Responses => {
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code, "message": msg},
             });
             let body = json!({"type": "response.failed", "response": resp});
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -2113,6 +2646,39 @@ mod tests {
         assert_eq!(session_preview(&empty_tail), "前文");
     }
 
+    /// issue #154：三协议图片形态统一识别（image_url / image / input_image），
+    /// 纯文本/字符串 content 恒无图；tool_result.content 内嵌图片递归命中
+    #[test]
+    fn body_has_image_detects_all_protocols() {
+        // OpenAI 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]}]})));
+        // Anthropic 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+        ]}]})));
+        // Responses 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.com/b.png"}
+        ]}]})));
+        // tool_result.content 内嵌图片
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/c.png"}}
+            ]}
+        ]}]})));
+        // 纯文本：无图
+        assert!(!body_has_image(&json!({"messages": [{"role": "user", "content": "hi"}]})));
+        assert!(!body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "纯文字"}
+        ]}]})));
+        // 无 messages / 空 content
+        assert!(!body_has_image(&json!({})));
+        assert!(!body_has_image(&json!({"messages": [{"role": "user"}]})));
+    }
+
     /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）
     fn remote_entry(key: &str, display: &str, factor: f64) -> Value {
         json!({
@@ -2189,5 +2755,71 @@ mod tests {
         let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
             .expect("CN 远程目录应命中");
         assert!(entry_is_global_only("TwaG4Same", &entry));
+    }
+
+    /// codex 审查【1】：HTTP 200 + 信封 statusCodeValue=400 走解码错误分支，
+    /// 此前只换号轮换、最终报「无健康账号」，context_length 清空指引丢失。
+    /// 完整复现解码链（信封行 → QoderTranslate → wb_sse::aggregate → ErrMeta）
+    fn decode_envelope_err(envelope: Value) -> Option<ErrMeta> {
+        let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let lines = vec![format!("data: {envelope}"), String::new()].into_iter();
+        let translated =
+            qoder_upstream::QoderTranslate::new(lines, slot.clone(), "chatcmpl-t", "m");
+        let (resp, error) = wb_sse::aggregate(translated, "chatcmpl-t", None);
+        assert!(resp.is_none() && error.is_some(), "信封错误应落解码错误分支");
+        let meta = slot.lock().unwrap().clone();
+        meta
+    }
+
+    #[test]
+    fn envelope_400_with_context_override_surfaces_hint() {
+        let decode = decode_envelope_err;
+        let raw = "{\"code\":\"InvalidParameter\",\"message\":\"context_length out of range\"}";
+        let meta = decode(json!({"statusCodeValue": 400, "body": raw}));
+
+        let mut set = json!({"id": "m", "upstreamKey": "m"});
+        qoder_upstream::apply_context_override(&mut set, Some(1_000_000));
+        let msg = envelope_context_reject(&set, meta.as_ref()).expect("应终局附指引");
+        assert!(msg.starts_with("upstream 400 error: "), "{msg}");
+        assert!(msg.contains("context_length out of range"), "保留上游原错误: {msg}");
+        assert!(msg.contains("context_length=1000000"), "附清空指引: {msg}");
+
+        // 未设置覆盖：维持原有轮换
+        let unset = json!({"id": "m", "upstreamKey": "m"});
+        assert!(envelope_context_reject(&unset, meta.as_ref()).is_none());
+        // 非 400 / 有既定语义的业务码（排队）不劫持
+        let m500 = decode(json!({"statusCodeValue": 500, "body": "boom"}));
+        assert!(envelope_context_reject(&set, m500.as_ref()).is_none());
+        let queued = decode(json!({"statusCodeValue": 400, "body": "{\"code\":\"10605\"}"}));
+        assert!(envelope_context_reject(&set, queued.as_ref()).is_none());
+    }
+
+    /// codex 复核：上游参数错误正文 `context_length exceeded the model limit` 含
+    /// "exceeded"，此前被额度泛词判成 Quota——上下文被拒分支（仅接 Unknown）
+    /// 不命中，继续换号并给健康账号记 HardCredit。须先于额度泛词识别为参数
+    /// 被拒，同时不吞 110 额度 / 10605 排队 / 401 / 403 账号错误
+    #[test]
+    fn envelope_context_length_exceeded_is_param_reject_not_quota() {
+        let mut set = json!({"id": "m", "upstreamKey": "m"});
+        qoder_upstream::apply_context_override(&mut set, Some(1_000_000));
+        let raw = "{\"code\":\"InvalidParameter\",\"message\":\"参数错误: context_length exceeded the model limit\"}";
+        let meta = decode_envelope_err(json!({"statusCodeValue": 400, "body": raw}));
+        assert_eq!(meta.as_ref().map(|m| m.kind), Some(UpstreamKind::Unknown), "{meta:?}");
+        let msg = envelope_context_reject(&set, meta.as_ref()).expect("应终局附指引，不换号");
+        assert!(msg.contains("context_length exceeded the model limit"), "{msg}");
+        assert!(msg.contains("context_length=1000000"), "{msg}");
+
+        // 账号错误码即便正文同样点名 context_length 也维持原分类、不劫持
+        let cases = [
+            (400, "{\"code\":\"110\",\"message\":\"context_length exceeded\"}", UpstreamKind::Quota),
+            (400, "{\"code\":\"10605\",\"message\":\"context_length exceeded\"}", UpstreamKind::Queued),
+            (401, "context_length exceeded", UpstreamKind::Auth),
+            (403, "context_length exceeded", UpstreamKind::Quota),
+        ];
+        for (status, body, want) in cases {
+            let meta = decode_envelope_err(json!({"statusCodeValue": status, "body": body}));
+            assert_eq!(meta.as_ref().map(|m| m.kind), Some(want), "{status} {body}");
+            assert!(envelope_context_reject(&set, meta.as_ref()).is_none(), "{status} {body}");
+        }
     }
 }

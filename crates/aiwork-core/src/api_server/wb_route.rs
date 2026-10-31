@@ -357,10 +357,13 @@ pub(crate) fn load_templates(state: &WbView) -> Vec<(String, String)> {
 
 /// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
 /// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
-/// 单键不分档；当前接线面仅 Trae 池（routes.rs solo 管线：流式/聚合/对冲
-/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）——WB 池（wb_sse
-/// 管线）与 qoder 未接入，接入时同键复用即可（工具集指纹是上游风控家族
-/// 共性，分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+/// 单键不分档；当前接线面：① Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）；② Qoder 池
+/// （issue #158 P1-1/P1-2：qoder_route 经 `apply_tool_alias_forward_value`
+/// 在 active_peek 上改写 → 响应侧 wb_sse 三回改点 + completion_to_anthropic 逆
+/// 映射，受 `qoder_sanitize` 池级开关门控）。WB 池（wb_sse 管线）未接入，接入时
+/// 同键复用即可（工具集指纹是上游风控家族共性，分档无收益）；每请求读取
+///（kv 单行 + mtime 缓存），保存即对下一请求生效
 pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
     let custom = crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
@@ -373,6 +376,12 @@ pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
+    // 传输层读错误哨兵（M3 审查收口）显式归 Server：msg 携带上游 io 文本，
+    // 关键词兜底可能误撞（如 "Too many open files" 命中下方 "too many" →
+    // SoftRate 60s），削弱读超时/慢上游的熔断恢复能力
+    if super::is_transport_read_err(code, msg) {
+        return ErrKind::Server;
+    }
     // 审查修复（M1）：4001/模型级豁免——模型在当前 function 下不可用是模型问题
     // 非账号问题（与 mod.rs classify_error/classify_solo_error 同口径），返回 None
     // 不冷却账号；否则单模型故障会被误判 Server 级触发整池 30 分钟熔断
@@ -443,6 +452,47 @@ impl Drop for HedgeLease {
     }
 }
 
+/// 竞速桥接行源读错误（wb_upstream 共享槽）合并进 error_info（issue #158 P2-2）：
+/// 行源被 `Box<dyn Iterator>` 擦拭类型 + `from_iterator` 桥接后，wb_sse 层只见
+/// 桥 EOF，读错误须由路由层从槽取出。仅覆盖「无错误」与「空完成哨兵」两种占位
+/// ——流内业务错误帧的 error_info 更具诊断价值，保留不覆盖。
+/// 返回 Some(哨兵) 表示该流/聚合被读错误终结（-9902 传输掐断或 -9903 普通
+/// 读错误，M3 按掐断特征分流）。
+fn merge_transport_cut_info(
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> Option<(i64, String)> {
+    match super::read_error_sentinel_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => Some(cut),
+            Some((c, m)) if super::is_empty_completion(c, &m) => Some(cut),
+            other => other,
+        },
+        None => error_info,
+    }
+}
+
+/// 聚合路径的掐断结果改写：槽有读错误时丢弃部分响应（非流式不得把截断数据
+/// 当成功交付，可能含残缺 tool_calls JSON），改写为 (None, Some(哨兵)) 走
+/// 流内错误换号路径；业务错误已存在时保留。空完成哨兵同样覆盖（审查修复：
+/// 零内容掐断时 aggregate 先落空完成哨兵，is_none() 守卫会漏合并——掐断被
+/// 计入空完成指纹口径，轮换耗尽时可误判 CHANNEL_FINGERPRINT_BLOCK；与流式
+/// merge_transport_cut_info 同口径：网络掐断不属于空完成）
+fn aggregate_with_transport_cut(
+    resp: Option<serde_json::Value>,
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> (Option<serde_json::Value>, Option<(i64, String)>) {
+    match super::read_error_sentinel_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => (None, Some(cut)),
+            Some((c, m)) if super::is_empty_completion(c, &m) => (None, Some(cut)),
+            other => (resp, other),
+        },
+        None => (resp, error_info),
+    }
+}
+
 /// 首字竞速胜者信息：生效账号（主/对冲接管者）+ 对冲计数租约
 struct RaceWin {
     lines: Box<dyn Iterator<Item = String> + Send>,
@@ -456,6 +506,10 @@ struct RaceWin {
     /// settle_hedge 据此对败者补记错误/冷却，账单可解释
     primary_failed: bool,
     hedge_failed: bool,
+    /// 胜者行源读错误共享槽（issue #158 P2-2）：行源被 Box 擦拭类型 + 桥接
+    /// 后，relay 线程的 io::Error 只能经槽跨层读取——路由层在 EOF 兜底处
+    /// 取出合并为传输掐断哨兵
+    read_slot: wb_upstream::ReadErrSlot,
 }
 
 /// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
@@ -476,17 +530,21 @@ fn race_first_byte(
 ) -> Result<RaceWin, ()> {
     let hedge_ms = state.route_hedge_ms();
     // issue #138：对冲关闭（hedge_ms==0）或大 body（> HEDGE_SKIP_BODY_BYTES，
-    // 对冲需 converted.to_vec() 全量快照 + 按 hedge 账号整包重建，瞬时内存
-    // 放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
+    // 对冲需 converted.to_vec() 全量快照 + 按 hedge 账号重建缓存键（H3），
+    // 瞬时内存放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
     if hedge_ms == 0 || converted.len() > super::routes::HEDGE_SKIP_BODY_BYTES {
-        return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
-            lines,
-            uid: primary_uid.to_string(),
-            hedge: None,
-            takeover: false,
-            primary_failed: false,
-            hedge_failed: false,
-        });
+        // P2-2：tracked 变体——行源被 Box 擦拭类型后读错误须经共享槽跨层读取
+        let read_slot = wb_upstream::new_read_err_slot();
+        return wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone())
+            .map(|lines| RaceWin {
+                lines,
+                uid: primary_uid.to_string(),
+                hedge: None,
+                takeover: false,
+                primary_failed: false,
+                hedge_failed: false,
+                read_slot,
+            });
     }
     let state2 = state.clone();
     let tried2 = tried.clone();
@@ -518,7 +576,17 @@ fn race_first_byte(
             enterprise_id: picked2.enterprise_id.clone(),
             global_region: picked2.global_region,
         };
-        let reader2 = wb_upstream::make_wb_request(&creds2, &conv_id2, &body).ok()?;
+        // H3 审查修复：body 是主账号 prepared 形态，prompt_cache_key 由主账号
+        // uid 派生——对冲账号直接复用会把主账号的缓存键带上游（跨账号前缀
+        // 缓存污染 / 对话内容泄露通道，违背账号硬隔离红线），必须按对冲账号
+        // 重建。重建失败（非对象/键缺失）沿用原 body（宁缺勿造语义不变）
+        let body2 = super::wb_payload::rewrite_prompt_cache_key_for(
+            &body,
+            &picked2.uid,
+            &conv_id2,
+        )
+        .unwrap_or_else(|| body.clone());
+        let reader2 = wb_upstream::make_wb_request(&creds2, &conv_id2, &body2).ok()?;
         *hedge_uid_slot.borrow_mut() = Some(picked2.uid.clone());
         Some((reader2, lease))
     };
@@ -539,6 +607,7 @@ fn race_first_byte(
                 takeover: out.takeover,
                 primary_failed: out.primary_failed,
                 hedge_failed: out.hedge_failed,
+                read_slot: out.read_slot,
             })
         }
         Err(()) => {
@@ -803,8 +872,14 @@ fn run_wb_stream(
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
                     let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        state.pool_label(),
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                    );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）
                     // 才标记，TTL 内同池新请求直接激进起步，不再从零试探烧账号
                     super::wb_payload::mark_channel_fp_block(
@@ -951,7 +1026,10 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded, None);
+                    // P2-2：竞速桥接行源的读错误在共享槽（wb_sse 只见桥 EOF）——
+                    // 合并为传输掐断哨兵，按账号无关故障处置
+                    let error_info = merge_transport_cut_info(error_info, &win.read_slot);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         // 宽口径提取（别名 + 字符串数字形态，审查 P2）
@@ -979,6 +1057,22 @@ fn run_wb_stream(
                     }
                     match error_info {
                         Some((code, msg)) => {
+                            if super::is_transport_cut(code, &msg) {
+                                // 传输层掐断（issue #158 P2-2，与 Trae 池 sse.rs 同口径）：
+                                // 账号无关的传输故障——不冷却、不解绑粘性、不计空完成
+                                // 指纹。未流出 → 换号（收尾帧未发）；已流出 → 就地收尾
+                                // （终止帧已由 stream_forward_ex EOF-with-content 分支
+                                // 补发，客户端看到完整流），上方通用记账块已落失败行
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&msg),
+                                    );
+                                    return;
+                                }
+                                break;
+                            }
                             if super::is_empty_completion(code, &msg) {
                                 // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
                                 // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
@@ -1341,8 +1435,14 @@ pub async fn wb_aggregate_chat(
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                        let (exhaust_msg, exhaust_tag) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                            state.pool_label(),
+                            empty_hits,
+                            tried.len(),
+                            healthy_total,
+                            hard_credit_cnt,
+                        );
                         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                         super::wb_payload::mark_channel_fp_block(
                             state.pool_label(),
@@ -1452,7 +1552,12 @@ pub async fn wb_aggregate_chat(
                         guard = settle_hedge(&state, &mut win, guard, &picked.uid);
                         let win_uid = win.uid.as_str();
                         let (resp, error_info) =
-                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()));
+                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), None);
+                        // P2-2：读错误槽合并——掐断时丢弃部分响应（非流式不得把
+                        // 截断数据当成功交付，可能含残缺 tool_calls JSON），按流内
+                        // 错误换号重试
+                        let (resp, error_info) =
+                            aggregate_with_transport_cut(resp, error_info, &win.read_slot);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(mut r), None) => {
@@ -1493,6 +1598,16 @@ pub async fn wb_aggregate_chat(
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // P2-2：传输层掐断（账号无关传输故障）——不冷却、不解绑
+                                // 粘性、不计空完成指纹，换号重试
+                                if super::is_transport_cut(code, &msg) {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&msg),
+                                    );
+                                    break;
+                                }
                                 // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                                 // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
                                 // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
@@ -1685,6 +1800,7 @@ pub async fn wb_aggregate_chat(
                     &resp,
                     &format!("msg_{}", now_ts()),
                     &model_out,
+                    None,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
                 Protocol::Responses => super::wb_responses::completion_to_responses(
@@ -1889,7 +2005,10 @@ pub async fn wb_tool_exec_chat(
                 let ttfb_start = Instant::now();
                 match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
-                        let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+                        // P2-2：tracked 行源 + 槽——聚合 EOF 掐断可识别，截断响应
+                        // 不得当成功交付（代执行场景会拿到残缺 tool_calls）
+                        let read_slot = wb_upstream::new_read_err_slot();
+                        let lines = match wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone()) {
                             Ok(l) => l,
                             Err(()) => {
                                 state.route_pool().note_error(&picked.uid, ErrKind::Server);
@@ -1899,8 +2018,23 @@ pub async fn wb_tool_exec_chat(
                         };
                         last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
                         let (completion, error_info) =
-                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
+                        // P2-2：读错误槽合并——掐断丢弃部分响应，按轮失败处理
+                        let (completion, error_info) =
+                            aggregate_with_transport_cut(completion, error_info, &read_slot);
                         if let Some((code, msg)) = error_info {
+                            // 传输层掐断（issue #158 P2-2）：账号无关传输故障——
+                            // 不冷却账号/模型；本轮按上游失败如实失败（不伪装成功）
+                            if super::is_transport_cut(code, &msg) {
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v1/responses", &model, stream, 200, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, last_ttfb_ms, &key_name,
+                                    &state.route_pool().name_of(&picked.uid), Some(&msg),
+                                );
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
+                                break Err(msg);
+                            }
                             // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                             // round 回退重跑当前轮（不消耗轮次，下一轮循环顶部
                             // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
@@ -2181,8 +2315,14 @@ pub async fn wb_tool_exec_chat(
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
                     let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        state.pool_label(),
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                    );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                     super::wb_payload::mark_channel_fp_block(
                         state.pool_label(),
@@ -2414,6 +2554,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_transport_cut_info_overrides_placeholder_only() {
+        // 槽空（正常完成/桥接未及拉取）：error_info 原样保留
+        let empty_slot = wb_upstream::new_read_err_slot();
+        assert!(merge_transport_cut_info(None, &empty_slot).is_none());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business.clone(), &empty_slot).unwrap().0,
+            11128
+        );
+
+        // 槽有读错误：None → 哨兵
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let merged = merge_transport_cut_info(None, &slot).expect("掐断必须上抛哨兵");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：空完成哨兵被覆盖（不计 empty_hits）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let empty = Some((
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+        let merged = merge_transport_cut_info(empty, &slot).expect("覆盖空完成占位");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：业务错误优先保留（不被覆盖）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business, &slot).unwrap().0,
+            11128,
+            "业务错误不得被掐断哨兵覆盖"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_transport_cut_discards_partial_resp() {
+        // 掐断 + 无业务错误 → 丢弃部分响应，改写哨兵（换号路径）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let partial = Some(serde_json::json!({"choices": [{"delta": {}}]}));
+        let (resp, err) = aggregate_with_transport_cut(partial, None, &slot);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃");
+        let (code, msg) = err.expect("掐断必须转错误通道");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+
+        // 正常完成（槽空）→ 原样
+        let empty_slot = wb_upstream::new_read_err_slot();
+        let full = Some(serde_json::json!({"choices": []}));
+        let (resp, err) = aggregate_with_transport_cut(full.clone(), None, &empty_slot);
+        assert_eq!(resp, full);
+        assert!(err.is_none());
+
+        // 业务错误已存在 → 保留（含部分响应为 None 的常规错误形态）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let (resp, err) =
+            aggregate_with_transport_cut(None, Some((11128i64, "illegal".into())), &slot);
+        assert!(resp.is_none());
+        assert_eq!(err.unwrap().0, 11128);
+
+        // 零内容掐断（审查修复）：aggregate 先落空完成哨兵 → 必须覆盖为掐断
+        // 哨兵，不得计入空完成指纹口径（否则轮换耗尽可误判指纹拦截）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("connection reset by peer".into());
+        let (resp, err) = aggregate_with_transport_cut(
+            None,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+            )),
+            &slot,
+        );
+        assert!(resp.is_none());
+        let (code, msg) = err.expect("掐断须覆盖空完成哨兵");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+    }
+
+    /// M3 回归锁：槽内读错误按掐断特征分流——掐断特征（RST_STREAM/连接重置）
+    /// → -9902（账号无关免冷却）；非掐断特征（读超时等）→ -9903 Server 口径
+    /// 哨兵（可被 classify_wb_error 归 Server，恢复账号质量熔断），且同样
+    /// 覆盖空完成哨兵（截断不计空完成指纹）
+    #[test]
+    fn read_error_sentinel_classifies_by_transport_cut_text() {
+        use crate::api_server::wb_upstream::new_read_err_slot;
+        // 掐断特征 → -9902
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM pushed".into());
+        let s = crate::api_server::read_error_sentinel_from_slot(&slot).expect("掐断错误应出哨兵");
+        assert!(crate::api_server::is_transport_cut(s.0, &s.1), "实际: {s:?}");
+        assert!(!crate::api_server::is_transport_read_err(s.0, &s.1));
+        // 非掐断特征（读超时）→ -9903，且 classify_wb_error 归 Server（冷却恢复）
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("timed out reading response".into());
+        let s = crate::api_server::read_error_sentinel_from_slot(&slot).expect("读超时应出哨兵");
+        assert!(crate::api_server::is_transport_read_err(s.0, &s.1), "实际: {s:?}");
+        assert!(!crate::api_server::is_transport_cut(s.0, &s.1));
+        assert!(
+            matches!(classify_wb_error(s.0, &s.1), ErrKind::Server),
+            "读超时哨兵必须走 Server 冷却口径"
+        );
+        // 聚合路径：读错误哨兵同样覆盖空完成（截断不得计空完成指纹）
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("timed out reading response".into());
+        let empty = Some((
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+        let (resp, err) = aggregate_with_transport_cut(None, empty, &slot);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃");
+        let (code, msg) = err.expect("读错误必须覆盖空完成哨兵");
+        assert!(crate::api_server::is_transport_read_err(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+    }
+
+    #[test]
     fn classify_wb_error_ranges() {
         assert!(matches!(classify_wb_error(401, "x"), ErrKind::SessionDead));
         assert!(matches!(classify_wb_error(429, "x"), ErrKind::SoftRate));
@@ -2433,6 +2694,19 @@ mod tests {
         ));
         // 与渠道级 11128 互不误撞
         assert!(!matches!(classify_wb_error(11128, "request illegal"), ErrKind::Forbidden));
+        // M3 审查收口：读错误哨兵显式归 Server——io 文本关键词不得把 -9903
+        // 误降级 SoftRate（现实样本 "Too many open files" 命中 "too many"）
+        assert!(matches!(
+            classify_wb_error(-9903, "transport read error: Too many open files"),
+            ErrKind::Server
+        ));
+        assert!(matches!(
+            classify_wb_error(
+                -9903,
+                "transport read error: length limit exceeded while reading"
+            ),
+            ErrKind::Server
+        ));
     }
 
     /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；

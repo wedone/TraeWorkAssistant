@@ -467,6 +467,46 @@ pub fn buddy_ai_pool_status() -> Vec<PoolStatus> {
     }
 }
 
+// ==================== 池级指纹清洗开关（issue #158 P1-4，移植 main@be198af） ====================
+
+/// 池级指纹清洗开关视图：`wb_sanitize`（wb + Trae 池共用）与 `qoder_sanitize`
+/// （Qoder 池独立，池级风控画像分开治理）。清洗是防风控手段，默认恒开；
+/// 网关未注册时返回错误（与 api_debug_toggle 同口径）——前端按加载失败
+/// 置灰展示，避免「可点但保存必失败」的误导态（审查修复：此前回显默认值，
+/// 置灰设计失效）
+pub fn sanitize_switches_get() -> Result<serde_json::Value, String> {
+    let shared = crate::api_server::runtime::gateway_shared()
+        .ok_or_else(|| "API 服务未运行，开关不可用".to_string())?;
+    Ok(serde_json::json!({
+        "wb": shared.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed),
+        "qoder": shared
+            .qoder_sanitize
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }))
+}
+
+/// 池级指纹清洗开关热切换：仅改内存 AtomicBool，下一请求即生效，无持久化
+/// （重启复位默认开——关清洗属临时排障手段，不做持久默认）
+pub fn sanitize_switch_set(pool: &str, enabled: bool) -> Result<(), String> {
+    let shared = crate::api_server::runtime::gateway_shared()
+        .ok_or_else(|| "API 服务未运行，开关不可用".to_string())?;
+    let (flag, label) = match pool {
+        "wb" => (&shared.wb_sanitize, "wb/Trae"),
+        "qoder" => (&shared.qoder_sanitize, "qoder"),
+        other => return Err(format!("未知清洗开关池: {other}")),
+    };
+    flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    // 关清洗是排障动作（会重新暴露客户端指纹、可能触发渠道风控），落一行
+    // app.log 留痕：事后复盘「何时关过哪个池」可查，无需依赖用户记忆
+    crate::fs_utils::app_log(
+        &shared.data_dir,
+        &format!(
+            "指纹清洗开关热切换：pool={label} enabled={enabled}（仅内存生效，网关重启复位为开启）"
+        ),
+    );
+    Ok(())
+}
+
 /// 网关运行中回写 Trae 池积分快照（issue #67，移植 main@36d628f）：
 /// refresh_remaining_credits 刷新后调用，让 expire_first 等策略基于最新积分选号。
 /// 此前刷新只写库不回写池，秃号内存中 credits>0 永远 selectable、粘性/策略持续
@@ -989,6 +1029,64 @@ pub fn trae_model_meta_get(
 /// 清除 Trae 模型元数据人工覆盖；返回是否存在过
 pub fn trae_model_meta_clear(state: &AppState, model: String) -> Result<bool, String> {
     crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
+}
+
+// ==================== 按模型长上下文（按池隔离：Trae 开关 / Qoder 数值） ====================
+
+/// Trae 长上下文开关视图：已开启的模型（canonical_id）；未列出 = 跟随上游
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TraeLongContextView {
+    pub enabled: Vec<String>,
+}
+
+pub fn trae_long_context_list(state: &AppState) -> TraeLongContextView {
+    TraeLongContextView {
+        enabled: crate::api_server::context_window::trae_list(&state.data_dir)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// 开启/关闭单模型长上下文（仅 Trae 池）；支持表外模型拒绝开启。返回生效状态
+pub fn trae_long_context_set(state: &AppState, model: String, enabled: bool) -> Result<bool, String> {
+    crate::api_server::context_window::trae_set(&state.data_dir, &model, enabled)
+}
+
+/// Qoder 上下文长度单条（管理面列表行）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthItem {
+    pub model: String,
+    pub tokens: u64,
+}
+
+/// Qoder 上下文长度视图：已设置条目 + 合法区间（未列出的模型 = 跟随上游）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthView {
+    pub items: Vec<QoderContextLengthItem>,
+    pub min: u64,
+    pub max: u64,
+}
+
+pub fn qoder_context_length_list(state: &AppState) -> QoderContextLengthView {
+    use crate::api_server::context_window as cw;
+    QoderContextLengthView {
+        items: cw::qoder_list(&state.data_dir)
+            .into_iter()
+            .map(|(model, tokens)| QoderContextLengthItem { model, tokens })
+            .collect(),
+        min: cw::QODER_MIN_TOKENS,
+        max: cw::QODER_MAX_TOKENS,
+    }
+}
+
+/// 设置单模型 Qoder 上下文长度（仅 Qoder 池）；`tokens` 为 null/0 = 清除（跟随上游）。
+/// 保存即对下一请求生效（config_cache 显式失效），返回生效值
+pub fn qoder_context_length_set(
+    state: &AppState,
+    model: String,
+    tokens: Option<u64>,
+) -> Result<Option<u64>, String> {
+    crate::api_server::context_window::qoder_set(&state.data_dir, &model, tokens)
 }
 
 // ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================

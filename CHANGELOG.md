@@ -6,6 +6,55 @@
 
 ---
 
+## [1.5.10] · 2026-10-31 · 按模型上下文窗口设置（#163/#165）+ 上游断连死循环修复（#164）
+
+> 合并 PR #165 按模型上下文窗口设置，纳入 Docker 用户实战报告的断连死循环紧急修复（issue #164），另修配置缓存与静态缓存两处基础设施问题。main 分支无对应提交，本条目为本分支自管记录。
+
+### 新功能
+
+- **按模型上下文窗口设置（issue #163，PR #165）**：Trae 按模型勾选长上下文（注入 `is_max_mode:true`，11 模型支持表门控）、Qoder 按模型设置数值（下发 `parameters.context_length`，流式与聚合全覆盖）；WorkBuddy 客户端无请求侧字段，明确不提供。未设置的模型请求逐字节保持现状。
+- **管理面口径澄清（issue #163）**：模型目录「默认上下文」列改名并补 tooltip，防静态声明值被误解为按模型可配置的生效值。
+
+### 修复与加固
+
+- **上游中途断连双线程死循环（issue #164）**：对端 FIN 后 read 恒立即报错，`relay_lines` 转发线程与对冲路径吞 Err 的 `chain_rest` 互相泵错误形成双线程死循环——容器 CPU 恒烧 2 核不自愈，伴生 CLOSE-WAIT fd 泄漏与对冲账号租约僵死。修复：读错误转发一次后立即退出（错误仍达折叠点，掐断可见性不变），reader 随线程退出关闭 fd；与 1.5.9 消费侧折叠（#158 P2-2）形成双保险，全池受益。附回归测试 2 条。
+- **Qoder 400 拒绝 context_length 如实分类（issue #163）**：按业务拒绝分类，不再误判 Quota 冷却健康账号；信封 400 终局处理不换号不冷却，错误信息附清空设置指引。
+- **config_cache 每键代际校验**：迟到回填不再覆盖失效后的新值，修复「保存成功但下一请求仍读旧配置」。
+- **静态资源缓存头**：`/assets/*` 长缓存 immutable，其余响应 `no-store`，杜绝部署后旧 chunk 被继续引用。
+
+### 验证
+
+- `cargo test --workspace`（898 通过 0 失败，含 issue #164 回归测试 2 条）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
+## [1.5.9] · 2026-10-30 · 语义移植 main f04d495 => dfa6e02
+
+> 语义移植 main `f04d495`（不含）=> `dfa6e02`（7 提交，未 merge）。跳过桌面/OS 专属或本分支不适用内容：托盘与通知渠道系统（main.rs/notify.rs/PushPlus，含 dfa6e02 托盘 push_notify_bg 与 workbuddy push_notify 后台线程版重构——本分支 Web 化已移除桌面通知栈）、豆包存储链路（commands/doubao.rs）、桌面浏览器打开（Web 化已移除）、QoderWork 快照 .bak 回退（无 switcher 模块）、版本号 chore（本分支版本自管）。
+
+### 新功能
+
+- **多客户端指纹布防扩充（#150/#155）**：七款客户端最新请求形态补齐身份句整句改写与 aggressive 兜底，残指纹特征表扩充；ZCode 双身份句实证布防；工具别名内置表扩至 41 条（请求侧改写、响应侧回改）。
+- **Qoder 池指纹清洗管线（#158 P1）**：清洗与工具别名接入 Qoder 池（清洗打副本、原始 peek 留记账与图片门控；会话稳定种子换号递增逃逸方差）；池级开关与 wb 池独立热切换；指纹拦截短记忆对齐 trae/buddy 池。
+- **传输层掐断可见化（#158 P2）**：掐断哨兵 `-9902` 全池接线——不冷却账号/模型、不解绑粘性、不计空完成指纹；有内容就地收尾落账失败、零内容换号；非流式聚合丢弃截断响应自动换号。
+- **Qoder 轮换预算（#156）**：45s 轮换总预算，超预算按 exhaust 语义收尾错误必达；首字超时补记模型级 Server 冷却。
+- **图片输入适配（#154）**：Anthropic image 与 Responses input_image 统一映射 OpenAI image_url；Qoder 上游不支持图片明示 400 拒绝，不静默丢图。
+
+### 修复与加固
+
+- **聚合侧传输掐断补齐（#158 P2-1，dfa6e02）**：Trae PlainCollect 留存传输掐断读错误，aggregate/aggregate_text 上抛 `-9902` 哨兵——半截内容不再以 `finish_reason="stop"` 伪装成功；routes 聚合预检丢弃截断响应换号，不冷却不解绑；custom 流式/聚合掐断分支补 `set_last_error` 对齐观测口径。
+- **Qoder 聚合侧轮换预算与双败冷却（#156，dfa6e02）**：聚合路径补 45s 轮换预算（超预算按 exhaust 语义收尾 + 非指纹主导补模型级冷却对齐流式）；竞速双败补记模型级 Server 冷却。
+- **Qoder 耗尽错误帧按协议分流（dfa6e02）**：流式轮换耗尽/预算收尾错误帧按客户端协议分流（Anthropic `event: error`、Responses `response.failed`），`send_stream_error_named` 保持字符串 code `"no_healthy_account"` 客户端兼容。
+- **Anthropic 图片 MIME 白名单（dfa6e02）**：base64 内嵌图 `media_type` 白名单校验（png/jpeg/webp/gif），白名单外丢块不透传上游，防异常 MIME 注入 data: URL 前缀。
+- **WB 刷新解码失败如实上抛（dfa6e02）**：CN/intl 刷新响应解码失败不再 `unwrap_or_default` 落 Null 伪装成「无 accessToken」误导重新登录。
+- **11128 强制清洗激进口径贯穿（dc8a382）**：主/对冲同强度不回落重算；轮换耗尽文案指路工具别名 tab；content_filter→refusal 语义归位。
+- **用量统计契约对齐（dc8a382）**：UsageDayView/mergeDay 补 cached_tokens 与 p50，明细失败独立错误态、DST 与 sessPage 回写。
+- **UI 全局最小逻辑宽度（#152）**：`--app-min-width` 变量 + 整体横向滚动，Sidebar sticky 常驻；仅 ≥768px 桌面视口生效（本分支 Web 化无 TitleBar，main 口径的「TitleBar 固定全宽」不适用）。
+- **vault 故障不销毁凭证（#153）**：写失败不落库直接返 Err，数据库保持原状；`vault_down` 暂态防误判永久禁用；data_dir canonicalize Junction 提示与日志去重。
+- **Qoder 免费模型与文案（#156）**：DeepSeek-Flash 纳入 0 倍率免费活动；积分耗尽文案明示次日 04:00 恢复且已禁用账号不计入；429 冷却补处理指引。
+
+### 验证
+
+- `cargo test --workspace`（873 通过）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
 ## [1.5.8] · 2026-10-27 · 语义移植 main aa4ec5a => f04d495
 
 > 语义移植 main `aa4ec5a`（不含）=> `f04d495`（9 提交，未 merge）。跳过：切换器链路（095e3ca 部分、84a5402、c440b20，本分支无 switcher 模块）与豆包桌面端开关（c097170，本分支无 doubao 模块）。

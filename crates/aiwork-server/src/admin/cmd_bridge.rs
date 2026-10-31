@@ -405,6 +405,13 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "wb_pool_status" => to_json(api_server_cmd::wb_pool_status()),
         "qoder_pool_status" => to_json(api_server_cmd::qoder_pool_status()),
         "buddy_ai_pool_status" => to_json(api_server_cmd::buddy_ai_pool_status()),
+        // 池级指纹清洗开关（issue #158 P1-4，移植 main@be198af）
+        "sanitize_switches_get" => api_server_cmd::sanitize_switches_get().and_then(to_json),
+        "sanitize_switch_set" => {
+            let pool = arg::<String>(&args, "pool")?;
+            let enabled = arg(&args, "enabled")?;
+            api_server_cmd::sanitize_switch_set(&pool, enabled).and_then(to_json)
+        }
         "api_logs_list" => to_json(api_server_cmd::api_logs_list(state)),
         "api_logs_detail" => {
             let date = arg(&args, "date")?;
@@ -503,6 +510,19 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "trae_model_meta_clear" => {
             let model = arg(&args, "model")?;
             api_server_cmd::trae_model_meta_clear(state, model).and_then(to_json)
+        }
+        // 按模型长上下文（按池隔离；只影响请求侧，不改目录/计费）
+        "trae_long_context_list" => to_json(api_server_cmd::trae_long_context_list(state)),
+        "trae_long_context_set" => {
+            let model = arg(&args, "model")?;
+            let enabled = arg(&args, "enabled")?;
+            api_server_cmd::trae_long_context_set(state, model, enabled).and_then(to_json)
+        }
+        "qoder_context_length_list" => to_json(api_server_cmd::qoder_context_length_list(state)),
+        "qoder_context_length_set" => {
+            let model = arg(&args, "model")?;
+            let tokens = opt_arg(&args, "tokens")?;
+            api_server_cmd::qoder_context_length_set(state, model, tokens).and_then(to_json)
         }
 
         // ==================== wb_config（WB 手工配置） ====================

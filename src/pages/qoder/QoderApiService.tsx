@@ -3,6 +3,7 @@ import { RefreshCw, Save, Coins, ToggleLeft, Activity, Layers } from 'lucide-rea
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import { PoolHealthBadges } from '../../components/api/PoolHealthBadges';
+import QoderContextLengthModal from '../../components/api/QoderContextLengthModal';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -10,6 +11,7 @@ import type {
   ApiPoolFile,
   GroupView,
   PoolStatus,
+  QoderContextLengthView,
   SchedulerConfig,
   TagView,
   UnifiedModel,
@@ -37,8 +39,9 @@ export default function QoderApiService() {
   // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
   const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
   const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
-  // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 +
-  // 取号豁免零积分过滤；上游活动结束后关闭恢复官方同步倍率
+  // 免费活动模型倍率覆盖（issue #111/#156，默认开）：Qwen3.8-Flash 与
+  // DeepSeek-Flash 目录倍率按 0 处理 + 取号豁免零积分过滤；上游活动结束后
+  // 关闭恢复官方同步倍率
   const [flashFreeRate, setFlashFreeRate] = useState(true);
   const [savingFlashFree, setSavingFlashFree] = useState(false);
   // per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：并发 0 = 不限、池粘性 0 = 关
@@ -55,6 +58,13 @@ export default function QoderApiService() {
   const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [models, setModels] = useState<UnifiedModel[]>([]);
+  // 单模型上下文长度（kv qoder_context_length，仅 Qoder 池；与 Trae 页长上下文开关分表互不影响）
+  const [ctxView, setCtxView] = useState<QoderContextLengthView | null>(null);
+  const [ctxEditing, setCtxEditing] = useState<UnifiedModel | null>(null);
+  const ctxMap = useMemo(
+    () => new Map((ctxView?.items ?? []).map((it) => [it.model, it.tokens])),
+    [ctxView],
+  );
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -74,7 +84,7 @@ export default function QoderApiService() {
     try {
       // 审查 F1：账号列表失败时返回 null（区别于「成功但空数组」）
       let accsErr: unknown = null;
-      const [pf, accs, cat, groups, tags] = await Promise.all([
+      const [pf, accs, cat, groups, tags, ctx] = await Promise.all([
         api.apiServer.poolList().catch(() => null),
         api.qoder
           .accountsList()
@@ -88,8 +98,11 @@ export default function QoderApiService() {
           .catch(() => [] as UnifiedModel[]),
         api.qoder.groups.list().catch(() => [] as GroupView[]),
         api.tags.list().catch(() => [] as TagView[]),
+        api.apiServer.qoderContextLengthList().catch(() => null),
       ]);
       setPool(pf);
+      // 失败保留旧值（列内按跟随上游展示，入口禁用）
+      if (ctx) setCtxView(ctx);
       if (accs === null) {
         // 审查 F1：读取失败 → 错误态 + toast，不落空数组（不触发空集引导）
         setAccountsError(String(accsErr));
@@ -226,8 +239,8 @@ export default function QoderApiService() {
       pushToast(
         'success',
         flashFreeRate
-          ? '已开启：Qwen3.8-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
-          : '已关闭：Qwen3.8-Flash 恢复官方同步倍率',
+          ? '已开启：Qwen3.8-Flash / DeepSeek-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
+          : '已关闭：免费活动模型恢复官方同步倍率',
       );
       // 审查修复（H3）：同 saveFlags——保存成功后回读最新池配置，避免其他端改动被
       // 页面加载时的旧快照静默回退后本地无感知（回读失败静默，不误报保存失败）
@@ -789,10 +802,11 @@ export default function QoderApiService() {
                   : '已关闭定时同步，仅手动同步'}
               </span>
             </div>
-            {/* Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：上游免费活动期
+            {/* 免费活动模型倍率覆盖（issue #111/#156，默认开）：上游免费活动期
                 usage.billable=false 实际不扣分，但 model/list 目录价随低峰折扣漂移
-               （0.1/0.08）不反映免费——开启时该模型倍率按 0 处理（展示 0× + 零积分
-                账号豁免参与调度），上游活动结束后关闭恢复官方同步倍率 */}
+               （Qwen3.8-Flash 0.1/0.08、DeepSeek-Flash 0.1/0.2）不反映免费——开启时
+                免费活动模型倍率按 0 处理（展示 0× + 零积分账号豁免参与调度），上游
+                活动结束后关闭恢复官方同步倍率 */}
             <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800">
               <label className="flex cursor-pointer items-center gap-1.5">
                 <input
@@ -800,7 +814,7 @@ export default function QoderApiService() {
                   checked={flashFreeRate}
                   onChange={(e) => setFlashFreeRate(e.target.checked)}
                 />
-                Qwen3.8-Flash 免费（0 倍率）
+                免费活动模型（0 倍率）
               </label>
               <button
                 className="btn-outline !px-2 !py-1"
@@ -811,7 +825,7 @@ export default function QoderApiService() {
               </button>
               <span className="text-slate-400 dark:text-zinc-500">
                 {flashFreeRate
-                  ? '免费活动期倍率按 0 处理（零积分账号可调度该模型）；活动结束后请关闭'
+                  ? '免费活动期倍率按 0 处理（Qwen3.8-Flash / DeepSeek-Flash，零积分账号可调度）；活动结束后请关闭'
                   : '使用官方同步倍率（低峰折扣价，零积分账号不参与该模型调度）'}
               </span>
             </div>
@@ -821,7 +835,7 @@ export default function QoderApiService() {
               </p>
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[640px] text-sm">
+                <table className="w-full min-w-[720px] text-sm">
                   <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
                     <tr>
                       <th className="px-3 py-2 text-left">模型 ID</th>
@@ -829,12 +843,22 @@ export default function QoderApiService() {
                       <th className="px-3 py-2 text-left">厂商</th>
                       <th className="px-3 py-2 text-right">积分倍率</th>
                       <th className="px-3 py-2 text-left">思考档位</th>
-                      <th className="px-3 py-2 text-right">上下文</th>
+                      <th className="px-3 py-2 text-right" title="目录声明，只用于展示，不改变实际请求">
+                        上下文
+                      </th>
+                      <th
+                        className="px-3 py-2 text-right"
+                        title="请求体 parameters.context_length（仅 Qoder 池）；跟随上游 = 不下发该字段。点击设置"
+                      >
+                        上下文长度设置
+                      </th>
                       <th className="px-3 py-2 text-center">图片支持</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {models.map((m) => (
+                    {models.map((m) => {
+                      const ctxTokens = ctxMap.get(m.id.trim().toLowerCase());
+                      return (
                       <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                         <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
                         <td className="px-3 py-2">{m.display || '—'}</td>
@@ -848,6 +872,24 @@ export default function QoderApiService() {
                         <td className="px-3 py-2 text-right tabular-nums text-xs text-slate-500">
                           {m.context_length != null ? `${Math.round(m.context_length / 1000)}k` : '—'}
                         </td>
+                        <td className="px-3 py-2 text-right text-xs">
+                          <button
+                            className={
+                              ctxTokens != null
+                                ? 'chip bg-zinc-100 tabular-nums text-zinc-700 hover:ring-1 hover:ring-brand-400 dark:bg-zinc-800 dark:text-zinc-200'
+                                : 'text-slate-400 hover:text-brand-500 disabled:cursor-not-allowed dark:text-zinc-500 dark:hover:text-brand-400'
+                            }
+                            disabled={ctxView === null}
+                            title={
+                              ctxTokens != null
+                                ? `parameters.context_length = ${ctxTokens.toLocaleString()}（点击修改 / 恢复跟随上游）`
+                                : '跟随上游：请求不带 context_length（点击设置）'
+                            }
+                            onClick={() => setCtxEditing(m)}
+                          >
+                            {ctxTokens != null ? ctxTokens.toLocaleString() : '跟随上游'}
+                          </button>
+                        </td>
                         <td className="px-3 py-2 text-center text-xs">
                           {m.supports_image === true ? (
                             <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
@@ -856,7 +898,8 @@ export default function QoderApiService() {
                           )}
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -865,6 +908,12 @@ export default function QoderApiService() {
               <Coins size={13} className="text-amber-500" />
               倍率为 Qoder 通用 credits 消耗倍率；产品决策下线的模型（Auto / Cantus / Efficient /
               Performance / Sonus / Ultimate）已从目录与路由移除。
+            </p>
+            <p className="mt-2 text-xs leading-5 text-slate-400 dark:text-zinc-500">
+              「上下文长度设置」只作用于 Qoder 池：填 {(ctxView?.min ?? 1024).toLocaleString()} ~{' '}
+              {(ctxView?.max ?? 10_000_000).toLocaleString()} 的整数 token 后，该模型请求带{' '}
+              <code>parameters.context_length</code>；不填 = 跟随上游。上游不接受该值时请求返回 400，
+              点开该模型清空（恢复跟随上游）即可恢复。
             </p>
             {/* F-80-余 v2 Global 区标记说明：当前仅接入 CN 区（国内版）上游 */}
             <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:border-zinc-800 dark:bg-zinc-800/40 dark:text-zinc-400">
@@ -876,6 +925,30 @@ export default function QoderApiService() {
           </div>
         </div>
       </div>
+
+      <QoderContextLengthModal
+        model={ctxEditing?.id ?? null}
+        current={ctxEditing ? (ctxMap.get(ctxEditing.id.trim().toLowerCase()) ?? null) : null}
+        catalogContext={ctxEditing?.context_length ?? null}
+        min={ctxView?.min}
+        max={ctxView?.max}
+        onClose={() => setCtxEditing(null)}
+        onSaved={(model, tokens) => {
+          setCtxEditing(null);
+          // 本地即时回填（返回值即生效值），再后台对齐全表
+          const id = model.trim().toLowerCase();
+          setCtxView((prev) =>
+            prev && {
+              ...prev,
+              items: [
+                ...prev.items.filter((it) => it.model !== id),
+                ...(tokens != null ? [{ model: id, tokens }] : []),
+              ],
+            },
+          );
+          void api.apiServer.qoderContextLengthList().then(setCtxView).catch(() => {});
+        }}
+      />
     </div>
   );
 }

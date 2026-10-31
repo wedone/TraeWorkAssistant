@@ -472,6 +472,29 @@ fn append_results(state: &AppState, events: &[Value]) {
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
 
+/// 凭证缺失失败事件（issue #153 修复 2 回归收口）。vault_down 为 vault 暂态
+/// 故障，必须携带显式 `permanent: false`——调度器 `is_permanent_failure` 以
+/// 结构化字段为权威且显式 false 不得被文案翻案；此前误标 permanent:true 会
+/// 把暂态故障固化为「当日已跑」放弃重试，与「稍后自动恢复」文案自相矛盾。
+/// 其余 no_credential 类维持永久（无凭证时重试注定失败）。
+fn cred_missing_event(type_tag: Option<&str>, user_id: &str, name: &Value, note: &str) -> Value {
+    let mut ev = json!({
+        "user_id": user_id,
+        "name": name,
+        "status": "fail",
+        "permanent": note != "vault_down",
+        "message": if note == "vault_down" {
+            "凭证加密存储暂时不可用（vault 故障），稍后自动恢复".to_string()
+        } else {
+            format!("无可用凭证（{note}）")
+        },
+    });
+    if let Some(t) = type_tag {
+        ev["type"] = json!(t);
+    }
+    ev
+}
+
 /// 处理单账号签到（含 401 刷新一次重试）。返回 account 事件（不含 index）
 fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &CheckinOpts) -> Value {
     let aid = s_of(acct.get("id"));
@@ -486,7 +509,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     }
     let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, opts.lazy_hours);
     if creds.access_token.is_empty() {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "permanent": true, "message": format!("无可用凭证（{note}）") });
+        return cred_missing_event(None, &aid, &base_ev["name"], &note);
     }
     if refreshed {
         sync_pool_expiry(state, &aid, &creds);
@@ -952,7 +975,7 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let base_ev = json!({"type": "growth", "user_id": aid, "name": name});
     let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
     if creds.access_token.is_empty() {
-        return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "permanent": true, "message": format!("无可用凭证（{note}）") });
+        return cred_missing_event(Some("growth"), &aid, &base_ev["name"], &note);
     }
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 
@@ -1040,7 +1063,9 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
             sync_pool_expiry(state, &aid, &creds);
         }
         let mut item = json!({"user_id": aid, "refreshed": refreshed, "note": note});
-        if creds.access_token.is_empty() {
+        if creds.access_token.is_empty() && note != "vault_down" {
+            // vault_down（issue #153 修复 2）不得被覆写为 no_credential——
+            // 否则下游按「账号无凭证」处理，掩盖 vault 故障真相
             item["note"] = json!("no_credential");
         }
         items.push(item);
@@ -1051,6 +1076,32 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
 #[cfg(test)]
 mod wb_checkin_tests {
     use super::*;
+
+    #[test]
+    fn cred_missing_event_vault_down_is_transient() {
+        // 回归锁（issue #153 修复 2）：vault_down 暂态故障必须显式 permanent:false
+        //（调度器 is_permanent_failure 结构化优先），否则当日被剔除重试
+        let ev = cred_missing_event(None, "u1", &json!("acc1"), "vault_down");
+        assert_eq!(ev["permanent"], json!(false));
+        assert_eq!(ev["status"], json!("fail"));
+        assert!(ev["message"]
+            .as_str()
+            .unwrap()
+            .contains("凭证加密存储暂时不可用"));
+        // growth 形态带 type 标记，其余字段同口径
+        let ev = cred_missing_event(Some("growth"), "u1", &json!("acc1"), "vault_down");
+        assert_eq!(ev["type"], json!("growth"));
+        assert_eq!(ev["permanent"], json!(false));
+    }
+
+    #[test]
+    fn cred_missing_event_no_credential_stays_permanent() {
+        // 无凭证类维持永久（重试注定失败）；文案退化匹配（无 permanent 字段的
+        // 旧事件）也不受影响——显式 true 与「无可用凭证」关键词双保险
+        let ev = cred_missing_event(None, "u1", &json!("acc1"), "token 已过期");
+        assert_eq!(ev["permanent"], json!(true));
+        assert_eq!(ev["message"], json!("无可用凭证（token 已过期）"));
+    }
 
     #[test]
     fn scalar_of_unwraps_common_keys() {

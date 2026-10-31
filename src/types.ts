@@ -288,6 +288,13 @@ export interface Settings {
 /** 指纹清洗规则档位：wb = WB 池（workbuddy-cn / 国内档）；buddy-ai = 国际档独立表 */
 export type SanitizeTier = 'wb' | 'buddy-ai';
 
+// 池级指纹清洗开关视图（issue #158 P1-4）：仅内存热切换、重启复位默认开
+// wb = wb_sanitize（wb + Trae 池共用）；qoder = qoder_sanitize（Qoder 池独立）
+export interface SanitizeSwitches {
+  wb: boolean;
+  qoder: boolean;
+}
+
 /** 网关命中（指纹拦截/空完成影子风控）落下的指纹样本：供一键生成清洗规则 */
 export interface FingerprintSample {
   /** 11128 = 指纹拦截；empty = 空完成（影子风控收尾采样） */
@@ -549,6 +556,23 @@ export interface TraeModelMeta {
   enabled?: boolean | null;
 }
 
+/** Trae 长上下文开关（kv trae_long_context；trae_long_context_list）。仅 Trae 池生效，
+ *  与 Qoder 上下文长度分表存储、互不影响；未列出的模型 = 跟随上游 */
+export interface TraeLongContextView {
+  /** 已开启长上下文的模型（canonical_id） */
+  enabled: string[];
+}
+
+/** Qoder 上下文长度（kv qoder_context_length；qoder_context_length_list）。仅 Qoder 池生效，
+ *  请求体下发 parameters.context_length；未列出的模型 = 跟随上游（不下发字段） */
+export interface QoderContextLengthView {
+  /** 已设置条目（model 为 canonical_id） */
+  items: { model: string; tokens: number }[];
+  /** 合法区间（token，含端点） */
+  min: number;
+  max: number;
+}
+
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
 export interface ModelOption {
   id: string;
@@ -637,7 +661,7 @@ export interface ApiPoolFile {
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
-  /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
+  /** 免费活动模型倍率覆盖（issue #111/#156，默认开）：Qwen3.8-Flash / DeepSeek-Flash 目录倍率按 0 处理 + 取号豁免零积分过滤 */
   qoder_flash_free_rate?: boolean;
   /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
   qoder_account_concurrency_limit?: number;
@@ -685,6 +709,8 @@ export interface UsageDayView {
   stream_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 缓存读 tokens 累计（M4 审查修复；上游未下发时为 0） */
+  cached_tokens: number;
   /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
   credits: number;
   /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */

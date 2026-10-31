@@ -362,8 +362,10 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
                     // 暂态失败（网络/5xx → refresh_failed；refresh_busy（H3）→ 他进程
                     // 刷新中）带标记前缀，网关侧走 Server 熔断可自愈；仅永久失效
                     //（凭证缺失/过期需重登/PAT 被拒/refresh_token 被拒）走 SessionDead
-                    // 永久禁用（此前 refresh_failed 裸 Err 会被误标永久禁用）
-                    "refresh_failed" | "refresh_busy" => Err(format!(
+                    // 永久禁用（此前 refresh_failed 裸 Err 会被误标永久禁用）；
+                    // vault_down（issue #153 修复 2）：vault 系统性故障导致凭证
+                    // 读空——暂态，同样走熔断，故障恢复后自动自愈
+                    "refresh_failed" | "refresh_busy" | "vault_down" => Err(format!(
                         "{}qoder 凭证暂不可用(uid={uid}, status={note}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
                         crate::tasks::qoder_common::TRANSIENT_ERR_TAG
                     )),
@@ -383,6 +385,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         ),
         // 审查 #2：Qoder 线绑定带 "q:" 命名空间，与 WB 线共用 sticky_bindings 表互不串载
         qoder_sticky: StickyStore::load_ns(&state.data_dir, super::wb_sticky::QODER_NS),
+        qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
         wb_sanitize: std::sync::atomic::AtomicBool::new(true),
         // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）

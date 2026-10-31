@@ -475,7 +475,7 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
-      {/* 通知渠道（Trae / Buddy 全平台共用：Bark / Server酱 / Webhook；随底部「保存设置」统一保存） */}
+      {/* 通知渠道（全部应用共用：Bark / Server酱 / Webhook；随底部「保存设置」统一保存） */}
       {notifyForm && (
         <section className="card p-4">
           <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
@@ -488,86 +488,85 @@ export default function GeneralSettingsPanel() {
             </button>
           </div>
           <p className="mb-3 text-xs text-slate-400">
-            签到完成 / 调度任务失败时推送到手机（Bark / Server酱 / WxPusher）或自建 Webhook，Trae 与 Buddy
-            全平台共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
+            签到完成 / 调度任务失败时推送到手机（Bark / Server酱 / WxPusher）或自建 Webhook，对全部应用
+            （Trae、WorkBuddy、Qoder、Buddy 国际版）共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
           </p>
-          <div className="grid gap-4 text-sm md:grid-cols-2">
-            <div className="space-y-3">
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={notifyForm.enabled}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, enabled: e.target.checked })}
-                />
-                启用通知推送（总开关）
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={notifyForm.on_checkin_done}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, on_checkin_done: e.target.checked })}
-                />
-                签到完成时通知
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={notifyForm.on_task_failed}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, on_task_failed: e.target.checked })}
-                />
-                调度任务失败时通知
-              </label>
+          {/* 事件开关组：横排一条，与下方渠道输入视觉分离 */}
+          <div className="mb-3 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-sm dark:border-zinc-700/50 dark:bg-zinc-800/30">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={notifyForm.enabled}
+                onChange={(e) => setNotifyForm({ ...notifyForm, enabled: e.target.checked })}
+              />
+              启用通知推送（总开关）
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={notifyForm.on_checkin_done}
+                onChange={(e) => setNotifyForm({ ...notifyForm, on_checkin_done: e.target.checked })}
+              />
+              签到完成时通知
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={notifyForm.on_task_failed}
+                onChange={(e) => setNotifyForm({ ...notifyForm, on_task_failed: e.target.checked })}
+              />
+              调度任务失败时通知
+            </label>
+          </div>
+          <div className="grid gap-x-4 gap-y-3 text-sm sm:grid-cols-2">
+            <div>
+              <label className="label">Bark 推送地址</label>
+              <input
+                value={notifyForm.bark_url ?? ''}
+                onChange={(e) => setNotifyForm({ ...notifyForm, bark_url: e.target.value || null })}
+                placeholder="https://api.day.app/你的Key"
+                className="input w-full"
+              />
             </div>
-            <div className="space-y-3">
-              <div>
-                <label className="label">Bark 推送地址</label>
-                <input
-                  value={notifyForm.bark_url ?? ''}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, bark_url: e.target.value || null })}
-                  placeholder="https://api.day.app/你的Key"
-                  className="input w-full"
-                />
-              </div>
-              <div>
-                <label className="label">Server酱 SendKey</label>
-                <input
-                  value={notifyForm.serverchan_sendkey ?? ''}
-                  onChange={(e) =>
-                    setNotifyForm({ ...notifyForm, serverchan_sendkey: e.target.value || null })
-                  }
-                  placeholder="SCT…（sct.ftqq.com 获取）"
-                  className="input w-full"
-                />
-              </div>
-              <div>
-                <label className="label">通用 Webhook 地址</label>
-                <input
-                  value={notifyForm.webhook_url ?? ''}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, webhook_url: e.target.value || null })}
-                  placeholder="https://…（POST JSON，兼容企业微信机器人等自建端）"
-                  className="input w-full"
-                />
-              </div>
-              <div>
-                <label className="label">WxPusher appToken</label>
-                <input
-                  value={notifyForm.wxpusher_app_token ?? ''}
-                  onChange={(e) =>
-                    setNotifyForm({ ...notifyForm, wxpusher_app_token: e.target.value || null })
-                  }
-                  placeholder="AT_…（wxpusher.zjiecode.com 后台创建应用获取）"
-                  className="input w-full"
-                />
-              </div>
-              <div>
-                <label className="label">WxPusher UID（多个用英文逗号分隔）</label>
-                <input
-                  value={notifyForm.wxpusher_uids ?? ''}
-                  onChange={(e) => setNotifyForm({ ...notifyForm, wxpusher_uids: e.target.value || null })}
-                  placeholder="UID_…（公众号「wxpusher」→ 我的 → 我的 UID）"
-                  className="input w-full"
-                />
-              </div>
+            <div>
+              <label className="label">Server酱 SendKey</label>
+              <input
+                value={notifyForm.serverchan_sendkey ?? ''}
+                onChange={(e) =>
+                  setNotifyForm({ ...notifyForm, serverchan_sendkey: e.target.value || null })
+                }
+                placeholder="SCT…（sct.ftqq.com 获取）"
+                className="input w-full"
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="label">通用 Webhook 地址</label>
+              <input
+                value={notifyForm.webhook_url ?? ''}
+                onChange={(e) => setNotifyForm({ ...notifyForm, webhook_url: e.target.value || null })}
+                placeholder="https://…（POST JSON，兼容企业微信机器人等自建端）"
+                className="input w-full"
+              />
+            </div>
+            <div>
+              <label className="label">WxPusher appToken</label>
+              <input
+                value={notifyForm.wxpusher_app_token ?? ''}
+                onChange={(e) =>
+                  setNotifyForm({ ...notifyForm, wxpusher_app_token: e.target.value || null })
+                }
+                placeholder="AT_…（wxpusher.zjiecode.com 后台创建应用获取）"
+                className="input w-full"
+              />
+            </div>
+            <div>
+              <label className="label">WxPusher UID（多个用英文逗号分隔）</label>
+              <input
+                value={notifyForm.wxpusher_uids ?? ''}
+                onChange={(e) => setNotifyForm({ ...notifyForm, wxpusher_uids: e.target.value || null })}
+                placeholder="UID_…（公众号「wxpusher」→ 我的 → 我的 UID）"
+                className="input w-full"
+              />
             </div>
           </div>
         </section>

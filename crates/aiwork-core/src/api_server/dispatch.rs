@@ -1103,7 +1103,8 @@ fn pool_health(
                 .as_deref()
                 .map(|m| {
                     // 免费活动覆盖与取号同口径（resolve_overridden），否则开关开启时
-                    // Qwen3.8-Flash 预检仍按 0.1 目录价判非免费，零积分池被误挡
+                    // 免费活动模型（Qwen3.8-Flash / DeepSeek-Flash，issue #156）预检
+                    // 仍按目录价判非免费，零积分池被误挡
                     qoder_upstream::resolve_overridden(
                         m,
                         qoder_upstream::QoderRegion::Cn,
@@ -1347,6 +1348,7 @@ mod tests {
             qoder_sticky: super::super::wb_sticky::StickyStore::with_ns(
                 super::super::wb_sticky::QODER_NS,
             ),
+            qoder_sanitize: AtomicBool::new(true),
             buddy_ai_sticky: super::super::wb_sticky::StickyStore::with_ns(
                 super::super::wb_sticky::BUDDY_AI_NS,
             ),

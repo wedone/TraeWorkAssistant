@@ -2,6 +2,7 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod config_cache;
+pub mod context_window;
 pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
@@ -153,9 +154,9 @@ pub struct ApiSharedState {
     /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
     /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
     pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
-    /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
-    /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
-    /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
+    /// 免费活动模型倍率覆盖（issue #111/#156，默认开）：开启时 Qwen3.8-Flash /
+    /// DeepSeek-Flash 目录倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游
+    /// 活动结束后关闭恢复官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// Trae 池参与调度开关（api_pool.json.trae_enabled，默认开）：关闭后 Trae 目录
     /// 模型不路由 Trae 池（每个资源池管理自己的开关，与 wb_enabled/qoder_enabled 同族）
@@ -183,6 +184,10 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2 移植）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    /// Qoder 池指纹清洗开关（issue #158，默认开）：请求侧 sanitize + 模板映射 +
+    /// 工具别名正向改写、响应侧逆映射回改；与 Trae 池 wb_sanitize 独立（池级
+    /// 风控画像不同，分开治理），UI「指纹清洗」tab 池级开关热切换
+    pub qoder_sanitize: std::sync::atomic::AtomicBool,
     // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
     /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居）
     pub buddy_ai_pool: ApiPool,
@@ -278,6 +283,7 @@ pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState 
         qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
         qoder_sticky: wb_sticky::StickyStore::default(),
+        qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
         buddy_ai_pool: ApiPool::new(),
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
         trae_sticky: wb_sticky::StickyStore::default(),
@@ -844,6 +850,12 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
 /// 按 SOLO 业务错误码 + message 判定错误类别（流内 error 事件）
 pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     let msg_lower = msg.to_lowercase();
+    // 传输层读错误哨兵（M3 审查收口）显式归 Server：msg 携带上游 io 文本，
+    // 关键词兜底可能误撞（如 "Too many open files" 命中下方 "exceeded"/
+    // "too many" 类词 → SoftRate 60s），削弱读超时/慢上游的熔断恢复能力
+    if is_transport_read_err(code, msg) {
+        return ErrKind::Server;
+    }
     // 1005: Plan 套餐额度用尽 → 12 小时冷却
     // 仅匹配 "plan limit/plan_limit/plan quota" 短语：宽泛 contains("plan") 会把
     // "planned maintenance" 等消息误判为套餐耗尽、触发 12 小时冷却
@@ -908,6 +920,80 @@ pub const EMPTY_COMPLETION_MSG: &str =
 /// 判定是否空完成哨兵（流式转换层上抛 / 聚合响应零内容共用）
 pub fn is_empty_completion(code: i64, msg: &str) -> bool {
     code == EMPTY_COMPLETION_CODE || msg.starts_with("empty completion:")
+}
+
+// ==================== 传输层掐断识别（issue #158 报错A，P2-1） ====================
+
+/// 传输层掐断哨兵码：上游 h2 RST_STREAM / 连接重置等传输层错误掐断长流。
+/// 与账号质量无关（classify_solo_error 对该码落 Server 仅为 rotating 计算
+/// 兜底），调用方 routes 须在 classify 之前经 is_transport_cut 预检——
+/// 不冷却、不解绑粘性、不计空完成指纹，按 sent_any 分流（就地收尾/换号）
+pub const TRANSPORT_CUT_CODE: i64 = -9902;
+pub const TRANSPORT_CUT_MSG_PREFIX: &str = "transport cut:";
+
+/// 传输层掐断文案识别（issue #158 报错A：Trae 池 ~5min 长流被上游
+/// RST_STREAM 掐断）。仅作用于 io::Error 的 Display 文本（reqwest/hyper
+/// 传输层错误消息），不作用于上游业务错误消息——业务侧 4xx/5xx 文本即使
+/// 含相近词也不会走到这里（读错误只可能来自传输层）
+pub fn is_transport_cut_text(text: &str) -> bool {
+    let m = text.to_ascii_lowercase();
+    m.contains("rst_stream")
+        || m.contains("rst stream")
+        || m.contains("stream error")
+        || m.contains("http2")
+        || m.contains("h2 error")
+        || m.contains("goaway")
+        || m.contains("connection reset")
+        || m.contains("broken pipe")
+        || m.contains("connection closed before")
+}
+
+/// 判定是否传输层掐断哨兵（对齐 is_empty_completion 双口径：码相等 ||
+/// msg 前缀；sse 层上抛 / routes 消费共用）
+pub fn is_transport_cut(code: i64, msg: &str) -> bool {
+    code == TRANSPORT_CUT_CODE || msg.starts_with(TRANSPORT_CUT_MSG_PREFIX)
+}
+
+/// 传输层读错误（非掐断特征）哨兵码（M3 审查收口）：读错误若不命中掐断
+/// 特征（如读超时 "timed out reading response"），不得按「账号无关掐断」
+/// 免冷却处置——否则持续慢上游每轮都换号且永不冷却，绕过账号质量熔断。
+/// 与 -9902 同样保证截断不得伪装成功，但走各池 Server 级错误口径
+///（冷却账号/模型 + 换号或落账失败，由各池既有流内错误分支自然承接）
+pub const TRANSPORT_READ_ERR_CODE: i64 = -9903;
+pub const TRANSPORT_READ_ERR_MSG_PREFIX: &str = "transport read error:";
+
+/// 判定是否传输层读错误哨兵（双口径同 is_transport_cut）
+pub fn is_transport_read_err(code: i64, msg: &str) -> bool {
+    code == TRANSPORT_READ_ERR_CODE || msg.starts_with(TRANSPORT_READ_ERR_MSG_PREFIX)
+}
+
+/// 读错误哨兵分类（与 Trae 池 sse.rs 流式路径的 `filter(is_transport_cut_text)`
+/// 门控同口径，M3 审查收口）：命中掐断特征（RST_STREAM/连接重置等）→
+/// -9902 掐断哨兵（账号无关：不冷却/不解绑/不计空完成指纹）；其余读错误
+/// （读超时等）→ -9903 读错误哨兵（Server 口径，恢复熔断能力）
+pub fn read_error_sentinel(text: &str) -> (i64, String) {
+    if is_transport_cut_text(text) {
+        (
+            TRANSPORT_CUT_CODE,
+            format!("{TRANSPORT_CUT_MSG_PREFIX} {text}"),
+        )
+    } else {
+        (
+            TRANSPORT_READ_ERR_CODE,
+            format!("{TRANSPORT_READ_ERR_MSG_PREFIX} {text}"),
+        )
+    }
+}
+
+/// 从 wb_upstream 读错误共享槽构建读错误哨兵（issue #158 P2-2）：
+/// 竞速桥接/tracked 行源路径的读错误被 Box 擦拭类型后，wb_sse 层只见桥
+/// EOF，路由层在 EOF 兜底处经此取出上抛。槽空返回 None（正常完成）。
+/// M3：经 read_error_sentinel 按特征分流掐断/普通读错误——此前任意
+/// io::Error 一律升级 -9902，读超时也被按账号无关掐断免冷却
+pub fn read_error_sentinel_from_slot(
+    slot: &crate::api_server::wb_upstream::ReadErrSlot,
+) -> Option<(i64, String)> {
+    crate::api_server::wb_upstream::take_read_error_slot(slot).map(|e| read_error_sentinel(&e))
 }
 
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
@@ -1045,6 +1131,7 @@ mod inflight_tests {
             qoder_hedge_threshold_ms: AtomicU64::new(0),
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::with_ns(wb_sticky::QODER_NS),
+            qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
             buddy_ai_pool: pool::ApiPool::new(),
             buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_sticky: wb_sticky::StickyStore::with_ns(wb_sticky::BUDDY_AI_NS),
@@ -1160,6 +1247,16 @@ mod classify_tests {
         );
         // 对照：无付费短语的 exceeded 报文仍按既有口径归 SoftRate
         assert_eq!(classify_solo_error(4008, "quota exceeded"), ErrKind::SoftRate);
+        // M3 审查收口：读错误哨兵显式归 Server——io 文本关键词不得把 -9903
+        // 误降级 SoftRate（现实样本 "Too many open files" 命中 "exceeded" 类词）
+        assert_eq!(
+            classify_solo_error(-9903, "transport read error: Too many open files"),
+            ErrKind::Server
+        );
+        assert_eq!(
+            classify_solo_error(-9903, "transport read error: length limit exceeded"),
+            ErrKind::Server
+        );
     }
 
     /// 冷却语义：零时长（note_error no-op 的前置约定）、标识串、不解绑粘性
