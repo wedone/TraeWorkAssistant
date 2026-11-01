@@ -258,7 +258,8 @@ export default function QoderApiService() {
   };
 
   // 定时同步配置保存：scheduler configSet 真 patch 语义（整表替换，需携带全部字段）——
-  // 仅增删 disabled_tasks 中的 qoder-catalog-sync 与 task_times 的对应时刻
+  // 仅增删 disabled_tasks 中的 qoder-catalog-sync 与 task_times 的对应时刻；
+  // task_hours/jitter_minutes 原样回传，避免保存时误清其他任务配置
   const saveCatSync = async () => {
     setSavingCatSync(true);
     try {
@@ -270,6 +271,8 @@ export default function QoderApiService() {
           : [...new Set([...(cfg.disabled_tasks ?? []), 'qoder-catalog-sync'])],
         task_times: { ...(cfg.task_times ?? {}), 'qoder-catalog-sync': hhmm },
         task_modes: cfg.task_modes ?? {},
+        task_hours: cfg.task_hours ?? {},
+        jitter_minutes: cfg.jitter_minutes ?? {},
       };
       await withMinDelay(api.scheduler.configSet(next), 400);
       pushToast(

@@ -643,6 +643,10 @@ pub fn run_round(
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
+        // 账号间随机附加间隔（5~60s，防风控；批量入口专属，手动单账号不触发）
+        if i > 0 {
+            super::sleep_account_jitter();
+        }
         let idx = i + 1; // 1-based（前端 next[index-1] 定位行）
         let name = if acc.name.is_empty() { format!("账号{idx}") } else { acc.name.clone() };
 

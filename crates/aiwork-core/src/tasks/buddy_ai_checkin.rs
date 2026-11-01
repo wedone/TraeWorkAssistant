@@ -955,6 +955,10 @@ pub fn run_checkin_round(state: &AppState, emit: &mut dyn FnMut(&Value)) -> Valu
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
+        // 账号间随机附加间隔（5~60s，防风控；批量入口专属，手动单账号不触发）
+        if i > 0 {
+            super::sleep_account_jitter();
+        }
         // 单账号失败不中断整轮；凭证在锁外读（secure 回填），网络链全程无池锁
         let rec = tokens.get(id).cloned().unwrap_or_default();
         let token = rec.get("access_token").and_then(Value::as_str).unwrap_or("").to_string();

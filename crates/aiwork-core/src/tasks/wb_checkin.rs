@@ -674,6 +674,10 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
+        // 账号间随机附加间隔（5~60s，防风控；批量入口专属，手动单账号不触发）
+        if i > 0 {
+            super::sleep_account_jitter();
+        }
         // 单账号失败不中断整轮（python try/except 语义；Rust 直调无异常路径）
         let mut ev = process_account(state, &agent, acct, opts);
         ev["index"] = json!(i + 1);
@@ -1032,6 +1036,10 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+        }
+        // 账号间随机附加间隔（5~60s，防风控；批量入口专属，手动单账号不触发）
+        if i > 0 {
+            super::sleep_account_jitter();
         }
         let mut ev = process_account_growth(state, &agent, acct, flags);
         ev["index"] = json!(i + 1);

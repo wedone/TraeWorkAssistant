@@ -19,6 +19,18 @@ pub mod wb_credits;
 
 use crate::state::AppState;
 
+/// 签到批量流程的账号间随机附加间隔（秒）：在用户可配的固定间隔之外再随机等待
+/// 5~60s，进一步打散请求节奏（防风控）；仅批量入口使用，单账号手动签到不等待
+const CHECKIN_ACCOUNT_JITTER_SECS: std::ops::RangeInclusive<u64> = 5..=60;
+
+/// 账号间随机附加间隔：批量签到循环在 i > 0 时调用（固定间隔 + 本随机间隔），
+/// 随机源为线程本地 RNG，无需依赖 scheduler_cfg（常量口径，暂不做配置）
+pub fn sleep_account_jitter() {
+    use rand::Rng;
+    let secs = rand::thread_rng().gen_range(CHECKIN_ACCOUNT_JITTER_SECS);
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+}
+
 /// 构建 ureq agent（统一出口）。
 /// 直连语义：ureq 默认不读系统/环境代理（对齐 python OPENER 绕代理约定），
 /// 单请求可再用 `.timeout()` 覆盖。

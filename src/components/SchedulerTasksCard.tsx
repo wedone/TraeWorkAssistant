@@ -8,7 +8,8 @@ import type { SchedulerTaskView } from '../types';
 /**
  * 定时任务配置卡（Trae / Buddy 环境配置共用）：
  * 按平台展示内置调度任务开关（kv scheduler_cfg.disabled_tasks，缺省全开 = 推荐配置）、
- * 可编辑的每日触发时刻（kv scheduler_cfg.task_times，空 = 默认时刻）与最近一次执行摘要；
+ * 可编辑的每日触发时刻（kv scheduler_cfg.task_times，空 = 默认时刻）、签到类每日随机
+ * 延迟窗（kv scheduler_cfg.jitter_minutes，0~120 分钟，默认 30）与最近一次执行摘要；
  * wb-checkin 由外部 override 绑定 WorkBuddySettings.auto_checkin。
  */
 
@@ -33,6 +34,20 @@ const TASK_DESC: Record<string, string> = {
 
 /** 可配置「每小时/每N小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */
 const HOURLY_TASKS = ['wb-credits-snapshot', 'trae-credits-snapshot', 'trae-usage-sync'];
+
+/** 支持每日随机延迟的签到类任务（与服务端 JITTER_CAPABLE 对齐） */
+const JITTER_TASKS = ['trae-checkin', 'wb-checkin', 'wb-growth', 'qoder-checkin', 'buddy-ai-checkin'];
+
+/** 随机延迟窗缺省值与上限（分钟；与服务端 DEFAULT/MAX_JITTER_MINUTES 同口径） */
+const JITTER_DEFAULT = 30;
+const JITTER_MAX = 120;
+
+/** 有活动时间窗的签到任务（Qoder 0 点签到 + 10 点登录奖励、Buddy 每日活跃打卡）：
+ *  延迟上限收紧到 30 分钟，避免晚于活动窗口漏领 */
+const JITTER_WINDOW_TASKS = ['qoder-checkin', 'buddy-ai-checkin'];
+
+/** 任务生效的随机延迟上限（分钟） */
+const jitterMaxOf = (key: string) => (JITTER_WINDOW_TASKS.includes(key) ? JITTER_DEFAULT : JITTER_MAX);
 
 /** 外部接管开关（wb-checkin → settings.auto_checkin）：checked + 切换回调 */
 export interface TaskToggleOverride {
@@ -67,6 +82,10 @@ export default function SchedulerTasksCard({
   const [taskHours, setTaskHours] = useState<Record<string, number>>({});
   /** 间隔输入草稿（key → 原始字符串；保留清空等中间态，失焦时才数值化保存） */
   const [hourDrafts, setHourDrafts] = useState<Record<string, string>>({});
+  /** 每日随机延迟窗（key → 0..120 分钟；缺省 30，状态接口回填生效值） */
+  const [jitter, setJitter] = useState<Record<string, number>>({});
+  /** 随机延迟输入草稿（key → 原始字符串；同 hourDrafts，失焦时才保存） */
+  const [jitterDrafts, setJitterDrafts] = useState<Record<string, string>>({});
   const [toggling, setToggling] = useState<string | null>(null);
   const [timeSaving, setTimeSaving] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
@@ -83,6 +102,13 @@ export default function SchedulerTasksCard({
         setTimes(c.task_times ?? {});
         setModes(c.task_modes ?? {});
         setTaskHours(c.task_hours ?? {});
+        // 兼容全局整数形态：按签到类任务展开回显（服务端保存时同样落成 map）
+        const jitterCfg = c.jitter_minutes ?? {};
+        setJitter(
+          typeof jitterCfg === 'number'
+            ? Object.fromEntries(JITTER_TASKS.map((k) => [k, jitterCfg]))
+            : jitterCfg,
+        );
       })
       .catch(() => setDisabled([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -104,7 +130,7 @@ export default function SchedulerTasksCard({
     setToggling(key);
     try {
       // config_set 为整表替换：必须同时携带自定义时刻/执行模式/间隔小时数，否则会被清空
-      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times, task_modes: modes, task_hours: taskHours });
+      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times, task_modes: modes, task_hours: taskHours, jitter_minutes: jitter });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
       pushToast('success', next ? '任务已启用，明日按计划执行' : '任务已停用');
@@ -130,7 +156,7 @@ export default function SchedulerTasksCard({
     setTimes(next);
     setTimeSaving(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next, task_modes: modes, task_hours: taskHours });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next, task_modes: modes, task_hours: taskHours, jitter_minutes: jitter });
       setTimes(saved.task_times ?? {});
       pushToast('success', value ? `执行时间已改为 ${value}（当天已过新时刻会自动补跑）` : '已恢复默认执行时间');
       api.scheduler
@@ -152,7 +178,7 @@ export default function SchedulerTasksCard({
     setModes(next);
     setToggling(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: next, task_hours: taskHours });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: next, task_hours: taskHours, jitter_minutes: jitter });
       setModes(saved.task_modes ?? {});
       pushToast(
         'success',
@@ -178,7 +204,7 @@ export default function SchedulerTasksCard({
     setTaskHours(next);
     setTimeSaving(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: modes, task_hours: next });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: modes, task_hours: next, jitter_minutes: jitter });
       setTaskHours(saved.task_hours ?? {});
       pushToast('success', `已改为每 ${n} 小时执行一次（含积分快照与消耗/会话明细）`);
       api.scheduler
@@ -193,15 +219,38 @@ export default function SchedulerTasksCard({
     }
   };
 
+  /** 修改每日随机延迟窗（0..120，0 = 关闭，缺省 30；失焦时归一保存） */
+  const saveJitter = async (key: string, value: number) => {
+    const n = Math.min(jitterMaxOf(key), Math.max(0, Math.round(value) || 0));
+    const prev = jitter;
+    const next = { ...prev, [key]: n };
+    setJitter(next);
+    setTimeSaving(key);
+    try {
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: modes, task_hours: taskHours, jitter_minutes: next });
+      if (saved.jitter_minutes && typeof saved.jitter_minutes === 'object') setJitter(saved.jitter_minutes);
+      pushToast(
+        'success',
+        n > 0 ? `已设置每日随机延迟 0~${n} 分钟（当天已抽签的延迟保持不变）` : '已关闭该任务的每日随机延迟',
+      );
+    } catch (e) {
+      setJitter(prev);
+      pushToast('error', e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setTimeSaving(null);
+    }
+  };
+
   /** 恢复推荐配置：清空停用名单与自定义时刻（全部启用 + 默认时刻） */
   const resetRecommended = async () => {
     setResetting(true);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {}, task_modes: {}, task_hours: {} });
+      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {}, task_modes: {}, task_hours: {}, jitter_minutes: {} });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
       setModes(saved.task_modes ?? {});
       setTaskHours(saved.task_hours ?? {});
+      setJitter(saved.jitter_minutes && typeof saved.jitter_minutes === 'object' ? saved.jitter_minutes : {});
       pushToast('success', '已恢复推荐配置（全部任务启用 + 默认时刻）');
       api.scheduler
         .status()
@@ -216,9 +265,16 @@ export default function SchedulerTasksCard({
 
   // 恢复推荐按钮只覆盖本卡内的 kv 配置任务；外部 override 绑定的开关由自身行内开关恢复
   // （task_hours 回填生效值，仅 ≠2 视为自定义；modes 缺省 = every_hours 默认档，不算自定义）
+  // （jitter 回填生效值，仅 ≠30 默认窗视为自定义）
   const hasCustom =
     disabled.some((k) => taskKeys.includes(k)) ||
-    taskKeys.some((k) => times[k] || modes[k] || (taskHours[k] !== undefined && taskHours[k] !== 2));
+    taskKeys.some(
+      (k) =>
+        times[k] ||
+        modes[k] ||
+        (taskHours[k] !== undefined && taskHours[k] !== 2) ||
+        (JITTER_TASKS.includes(k) && jitter[k] !== undefined && jitter[k] !== JITTER_DEFAULT),
+    );
 
   return (
     <section className={`card p-4 ${className ?? ''}`}>
@@ -320,6 +376,34 @@ export default function SchedulerTasksCard({
                         />
                       )
                     )}
+                    {t && JITTER_TASKS.includes(key) && (
+                      <span className="flex items-center gap-1 text-xs text-slate-400">
+                        <input
+                          type="number"
+                          min={0}
+                          max={jitterMaxOf(key)}
+                          value={jitterDrafts[key] ?? String(jitter[key] ?? JITTER_DEFAULT)}
+                          disabled={timeSaving === key}
+                          onChange={(e) => setJitterDrafts({ ...jitterDrafts, [key]: e.target.value })}
+                          onBlur={() => {
+                            // 同 hourDrafts：输入过程保留原始字符串，失焦归一后保存；
+                            // 空串/非数字恢复已生效值，不触发保存
+                            const raw = (jitterDrafts[key] ?? '').trim();
+                            setJitterDrafts((prev) => {
+                              if (!(key in prev)) return prev;
+                              const next = { ...prev };
+                              delete next[key];
+                              return next;
+                            });
+                            if (raw === '' || Number.isNaN(Number(raw))) return;
+                            void saveJitter(key, Number(raw));
+                          }}
+                          className="w-14 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                          title={`每日在设定时刻后 0~${jitterMaxOf(key)} 分钟内随机延迟执行，0=关闭（失焦保存，默认 30）`}
+                        />
+                        分钟随机延迟
+                      </span>
+                    )}
                     {times[key] && t?.time !== undefined && (
                       <button
                         onClick={() => void saveTime(key, '')}
@@ -333,6 +417,11 @@ export default function SchedulerTasksCard({
                     {!on && <Badge tone="amber">已停用</Badge>}
                   </div>
                   <p className="mt-0.5 text-xs text-slate-400">{TASK_DESC[key] ?? ''}</p>
+                  {JITTER_TASKS.includes(key) && (
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      每日在设定时刻后 0~{jitter[key] ?? JITTER_DEFAULT} 分钟内随机延迟执行，0=关闭
+                    </p>
+                  )}
                   {t?.last_summary && (
                     <p
                       className={`mt-1 truncate text-xs ${

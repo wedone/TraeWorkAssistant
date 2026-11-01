@@ -393,6 +393,8 @@ export interface SchedulerConfig {
   task_modes?: Record<string, string>;
   /** every_hours 间隔小时数（key → 1..24，缺省 2）；仅 every_hours 模式任务生效 */
   task_hours?: Record<string, number>;
+  /** 签到类每日随机延迟窗（key → 0..120 分钟，缺省 30，0 = 关闭）；或全局整数（写入时落到全部签到类任务） */
+  jitter_minutes?: Record<string, number> | number;
 }
 
 export interface CheckinOpts {

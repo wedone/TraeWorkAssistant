@@ -1718,6 +1718,10 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
+        // 账号间随机附加间隔（5~60s，防风控；批量入口专属，手动单账号不触发）
+        if i > 0 {
+            super::sleep_account_jitter();
+        }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
         let mut ev = process_account(
             state,

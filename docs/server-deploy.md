@@ -268,4 +268,4 @@ curl -fsSL https://raw.githubusercontent.com/wedone/TraeWorkAssistant/docker_mai
 | 登录提示 token 无效 | 令牌取自 `conf/admin_token` 文件或 env 注入值；env 变更后需 `docker compose up -d` 重建；附加管理员令牌（设置页签发）同样可登录，吊销后立即失效 |
 | 签到时间不对 | 确认 `TZ=Asia/Shanghai` 未被覆盖 |
 | 手动签到无进度 | 实时通道走 WebSocket `/api/ws`（连接失败前端自动回退 SSE `/api/events/checkin`）；Nginx 需带 Upgrade 升级头并对 SSE `proxy_buffering off`（见上节示例） |
-| 定时任务没跑 | 任务由服务端内置调度器托管（05:30 Trae JWT 续期 / 05:40 模型列表同步 / 09:00 Trae 签到 / 09:10 WB 签到 / 10:30 WB 续期 / 23:30、23:40 积分快照），重启后自动补跑当天错过的任务；确认环境配置页对应任务开关未停用 |
+| 定时任务没跑 | 任务由服务端内置调度器托管（05:30 Trae JWT 续期 / 05:40 模型列表同步 / 09:00 Trae 签到 / 09:10 WB 签到 / 10:30 WB 续期 / 23:30、23:40 积分快照），重启后自动补跑当天错过的任务；确认环境配置页对应任务开关未停用；签到类任务还会在设定时刻后随机延迟 0~N 分钟（默认 30，可在环境配置页改为 0 关闭）并在账号间随机间隔 5~60 秒，实际执行时间可能晚于表中时刻 |

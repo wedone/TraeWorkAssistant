@@ -29,10 +29,20 @@
 //!   适配——模式走 settings 字段不入 scheduler_cfg.task_modes/HOURLY_CAPABLE）；
 //! - `buddy-ai-catalog-sync`（05:55，默认开）：模型目录同步（/v3/config 直连）。
 //!
+//! ## 每日随机延迟（签到类防风控）
+//!
+//! 签到类任务（JITTER_CAPABLE）到点判定通过后不立即执行，而是当天首次到点
+//! 时随机抽取 0..=jitter_minutes 的偏移并**持久化到 scheduler_state.jitter**（含日期
+//! 与任务 key），后续 tick 到随机时刻才执行。单线程 tick 顺序执行，不在判定阶段
+//! sleep，避免阻塞其他任务；抽签持久化保证重启/多次 tick 幂等（不重复抽签），
+//! 偏移只向后，绝不早于设定时刻。
+//!
 //! ## 状态
 //!
 //! kv `scheduler_state`：
 //! `{ "tasks": { "<key>": { "last_run_date", "last_run_ts", "last_ok", "last_fail_ts", "last_summary" } } }`
+//! 另有 `{ "jitter": { "<key>": { "date", "at" } } }`：签到类任务当日随机延迟执行时刻
+//! （at 为该时刻 HH:MM；跨日旧条目在下次抽签时整体重写，天然清理）。
 //! 前端经 `scheduler_status` 命令（命令桥分发到本模块）查看各任务最近一次执行情况。
 
 use serde_json::{json, Value};
@@ -141,6 +151,27 @@ const COMPACT_INTERVAL_HOURS: i64 = 6;
 /// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly/every_hours 值，其余任务恒为每日模式
 const HOURLY_CAPABLE: &[&str] =
     &["wb-credits-snapshot", "trae-credits-snapshot", "trae-usage-sync", "qoder-credits-snapshot"];
+
+/// 支持 scheduler_cfg.jitter_minutes（每日随机延迟窗）的签到类任务：
+/// 只有签到/成长类需要「不固定时刻」规避风控，快照/续期类不受影响
+const JITTER_CAPABLE: &[&str] =
+    &["trae-checkin", "wb-checkin", "wb-growth", "qoder-checkin", "buddy-ai-checkin"];
+
+/// 每日随机延迟窗默认宽度（分钟）：对齐 user-manual 说明（0 = 关闭）
+const DEFAULT_JITTER_MINUTES: i64 = 30;
+/// 随机延迟窗上限（分钟）：过大易错过活动窗口，前端输入框同口径 0–120
+const MAX_JITTER_MINUTES: i64 = 120;
+/// 有活动时间窗的签到任务：Qoder 0 点签到 + 10 点登录奖励、Buddy 每日活跃打卡，
+/// 延迟上限收紧到默认 30 分钟，避免晚于活动窗口漏领（前端输入框同步收紧）
+const JITTER_WINDOW_TASKS: &[&str] = &["qoder-checkin", "buddy-ai-checkin"];
+/// 任务生效的随机延迟上限（分钟）
+fn jitter_max_for(key: &str) -> i64 {
+    if JITTER_WINDOW_TASKS.contains(&key) {
+        DEFAULT_JITTER_MINUTES
+    } else {
+        MAX_JITTER_MINUTES
+    }
+}
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -258,6 +289,11 @@ fn board_platform(key: &str) -> Option<&'static str> {
 /// 单轮 tick：检查每个任务「今天已过触发时刻 && 今天未跑」→ 执行
 fn tick(st: &AppState) {
     let now = chrono::Local::now();
+    tick_at(st, &now);
+}
+
+/// 带时刻的 tick 主体（now 可注入便于纯逻辑复用；生产恒传 Local::now）
+fn tick_at(st: &AppState, now: &chrono::DateTime<chrono::Local>) {
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
     // T11：通知配置整轮读一次（签到成功/任务失败推送，内部再按总开关静默）
@@ -265,6 +301,9 @@ fn tick(st: &AppState) {
     // 调度配置与执行状态整轮各读一次（每 60s tick，避免每任务重复读 db）
     let cfg = load_cfg(st);
     let state = load_state(st);
+    // 随机延迟抽签结果整轮读一次；本 tick 抽签时同步更新内存副本，避免同轮
+    // 下一次读取覆盖/丢失（落库失败仅影响重启后的幂等，不影响本轮执行）
+    let mut jitter = load_jitter(st);
     let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
@@ -278,7 +317,15 @@ fn tick(st: &AppState) {
                 if now_hm.as_str() < hhmm.as_str() {
                     continue;
                 }
-                format!("每日 {hhmm}")
+                // 签到类每日随机延迟：到点后先抽签并落库，到随机时刻才真正执行；
+                // 抽签不 sleep，后续 tick 与其他任务的到点判定不受影响
+                if JITTER_CAPABLE.contains(&t.key) {
+                    let at = jitter_target(st, cfg.get("jitter_minutes"), t.key, &today, hhmm, &now_hm, &mut jitter);
+                    let Some(at) = at else { continue };
+                    format!("每日 {hhmm}（随机延迟至 {at}）")
+                } else {
+                    format!("每日 {hhmm}")
+                }
             }
             SchedPlan::Hourly => {
                 // hourly 按小时节流：仅成功执行记 last_run_ts（mark_run）
@@ -525,6 +572,8 @@ pub fn scheduler_config_get(st: &AppState) -> Value {
         "task_times": task_times(st),
         "task_modes": task_modes(st),
         "task_hours": task_hours(st),
+        // 签到类每日随机延迟窗（key → 分钟，缺省 30、0 = 关闭）
+        "jitter_minutes": jitter_minutes(st),
     })
 }
 
@@ -603,11 +652,50 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             hours.insert(k.clone(), n);
         }
     }
+    // 每日随机延迟窗（签到类防风控）：全局整数或按任务 map（键须为 JITTER_CAPABLE，
+    // 值 0..=任务上限，0 = 关闭；活动窗口任务上限 30、其余 120）；缺省键 = 默认 30。
+    // 非法值显式拒绝，不静默 clamp
+    let mut jitter = std::collections::HashMap::new();
+    if let Some(value) = cfg.get("jitter_minutes") {
+        let mut check = |k: &str, v: &Value| -> Result<i64, String> {
+            if !JITTER_CAPABLE.contains(&k) {
+                return Err(format!("任务 {k} 不支持随机延迟配置"));
+            }
+            let n = v
+                .as_i64()
+                .ok_or_else(|| format!("任务 {k} 的随机延迟应为整数分钟"))?;
+            let max = jitter_max_for(k);
+            if !(0..=max).contains(&n) {
+                return Err(format!("任务 {k} 的随机延迟 {n} 非法（应为 0–{max} 分钟）"));
+            }
+            Ok(n)
+        };
+        match value {
+            Value::Object(m) => {
+                for (k, v) in m {
+                    jitter.insert(k.clone(), check(k, v)?);
+                }
+            }
+            v => {
+                let n = v
+                    .as_i64()
+                    .ok_or("jitter_minutes 应为整数或 key → 分钟对象")?;
+                if !(0..=MAX_JITTER_MINUTES).contains(&n) {
+                    return Err(format!("随机延迟 {n} 非法（应为 0–120 分钟）"));
+                }
+                // 全局值落到所有签到类任务，便于前端整表回显与后续局部覆盖；
+                // 活动窗口任务按自身上限截断（否则会被读取侧 clamp，回显与保存不一致）
+                for k in JITTER_CAPABLE {
+                    jitter.insert((*k).to_string(), n.min(jitter_max_for(k)));
+                }
+            }
+        }
+    }
     // 落库失败必须上抛（审查 P3）：静默成功会让用户以为配置已保存，
     // 实际重启后回退旧配置；磁盘/busy 异常时命令如实报错
     crate::store::db(&st.data_dir).kv_set(
         "scheduler_cfg",
-        &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes, "task_hours": hours }),
+        &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes, "task_hours": hours, "jitter_minutes": jitter }),
     )?;
     fs_utils::app_log(
         &st.data_dir,
@@ -1194,6 +1282,117 @@ fn load_state(st: &AppState) -> Value {
     // SQLite 化（P2）：scheduler_state.json → kv `scheduler_state`
     let v: Value = crate::store::db(&st.data_dir).kv_get("scheduler_state");
     if v.is_object() { v } else { json!({}) }
+}
+
+// ── 每日随机延迟（签到类防风控）──────────────────────────────────────────────
+
+/// 随机延迟窗宽度（分钟）：value 取自 scheduler_cfg.jitter_minutes，支持全局整数
+/// 或按任务的 map（对齐 task_times/task_modes 的 key → 值结构）；缺省 30、
+/// 越界 clamp 0..=120、非整数视为默认
+fn effective_jitter_minutes(value: Option<&Value>, key: &str) -> i64 {
+    let pick = |v: &Value| v.as_i64();
+    let raw = match value {
+        Some(Value::Object(m)) => m
+            .get(key)
+            .and_then(pick)
+            .unwrap_or(DEFAULT_JITTER_MINUTES),
+        Some(v) => pick(v).unwrap_or(DEFAULT_JITTER_MINUTES),
+        None => DEFAULT_JITTER_MINUTES,
+    };
+    raw.clamp(0, jitter_max_for(key))
+}
+
+/// 延迟窗宽度表（key → 分钟；仅 JITTER_CAPABLE 任务）：查询时回填生效值，
+/// 前端整表回显与实际调度同源（同 task_hours 口径）
+fn jitter_minutes(st: &AppState) -> std::collections::HashMap<String, i64> {
+    let cfg = load_cfg(st);
+    let value = cfg.get("jitter_minutes");
+    JITTER_CAPABLE
+        .iter()
+        .map(|k| ((*k).to_string(), effective_jitter_minutes(value, k)))
+        .collect()
+}
+
+/// 读取当日已抽签的随机延迟时刻（key → (date, at HH:MM)）
+fn load_jitter(st: &AppState) -> std::collections::HashMap<String, (String, String)> {
+    let raw = load_state(st);
+    let mut out = std::collections::HashMap::new();
+    if let Some(m) = raw.get("jitter").and_then(Value::as_object) {
+        for (k, v) in m {
+            let (Some(date), Some(at)) = (v.get("date").and_then(Value::as_str), v.get("at").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            out.insert(k.clone(), (date.to_string(), at.to_string()));
+        }
+    }
+    out
+}
+
+/// 写入/更新单任务当日随机延迟时刻：保留其他任务条目，绑定 scheduler_state 单文档
+/// 落库（与 tasks 状态共用，避免多 kv 键半写分叉）。落库失败只告警——本轮内存副本
+/// 仍生效，最坏情况重启后重新抽签（只向后偏移，不会早于设定时刻）
+fn save_jitter(st: &AppState, key: &str, date: &str, at: &str) {
+    let mut root = load_state(st);
+    if let Some(obj) = root.as_object_mut() {
+        let jitter = obj.entry("jitter".to_string()).or_insert_with(|| json!({}));
+        if !jitter.is_object() {
+            *jitter = json!({});
+        }
+        jitter[key] = json!({ "date": date, "at": at });
+    }
+    if let Err(e) = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root) {
+        fs_utils::app_log(
+            &st.data_dir,
+            &format!("[调度器] 随机延迟抽签落库失败（task={key}）: {e}"),
+        );
+    }
+}
+
+/// 签到类任务当日随机延迟判定：返回 Some(随机时刻 HH:MM) = 可执行（未到当场再判）；
+/// None = 本 tick 跳过。宽 0 = 关闭随机延迟（直接按设定时刻执行）。
+/// 当日首次到点先抽签并持久化，重启后沿用同一结果（幂等不重复抽签）；
+/// 只向后偏移，避免早于设定时刻错过活动窗口
+fn jitter_target(
+    st: &AppState,
+    cfg_jitter: Option<&Value>,
+    key: &str,
+    today: &str,
+    hhmm: &str,
+    now_hm: &str,
+    memo: &mut std::collections::HashMap<String, (String, String)>,
+) -> Option<String> {
+    let width = effective_jitter_minutes(cfg_jitter, key);
+    if width <= 0 {
+        return Some(hhmm.to_string());
+    }
+    // 当天尚未抽签时先抽好延迟时刻（抽签偏移恒为非负：只向后延迟，避免早于
+    // 设定时刻错过活动窗口），与执行状态同文档落库，后续 tick/重启直接复用
+    let at = match memo.get(key) {
+        Some((date, at)) if date == today => at.clone(),
+        _ => {
+            use rand::Rng;
+            let offset = rand::thread_rng().gen_range(0..=width);
+            let at = add_minutes_hhmm(hhmm, offset);
+            memo.insert(key.to_string(), (today.to_string(), at.clone()));
+            save_jitter(st, key, today, &at);
+            fs_utils::app_log(
+                &st.data_dir,
+                &format!("[调度器] {key} 当日随机延迟 {offset} 分钟（{hhmm} → {at}）"),
+            );
+            at
+        }
+    };
+    // HH:MM 零填充，字符串比较即时间序；未到随机时刻本 tick 跳过
+    if now_hm < at.as_str() { None } else { Some(at) }
+}
+
+/// HH:MM + n 分钟 → HH:MM（跨日按 24h 回绕；入参已是合法 HH:MM）
+fn add_minutes_hhmm(hhmm: &str, minutes: i64) -> String {
+    let h = hhmm[..2].parse::<i64>().unwrap_or(0);
+    let m = hhmm[3..].parse::<i64>().unwrap_or(0);
+    let total = (h * 60 + m + minutes).rem_euclid(24 * 60);
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn last_run_date(state: &Value, key: &str) -> Option<String> {
