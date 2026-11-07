@@ -320,7 +320,7 @@ fn tick_at(st: &AppState, now: &chrono::DateTime<chrono::Local>) {
                 // 签到类每日随机延迟：到点后先抽签并落库，到随机时刻才真正执行；
                 // 抽签不 sleep，后续 tick 与其他任务的到点判定不受影响
                 if JITTER_CAPABLE.contains(&t.key) {
-                    let at = jitter_target(st, cfg.get("jitter_minutes"), t.key, &today, hhmm, &now_hm, &mut jitter);
+                    let at = jitter_target(st, cfg.get("jitter_minutes"), t.key, &today, &hhmm, &now_hm, &mut jitter);
                     let Some(at) = at else { continue };
                     format!("每日 {hhmm}（随机延迟至 {at}）")
                 } else {
@@ -657,7 +657,7 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
     // 非法值显式拒绝，不静默 clamp
     let mut jitter = std::collections::HashMap::new();
     if let Some(value) = cfg.get("jitter_minutes") {
-        let mut check = |k: &str, v: &Value| -> Result<i64, String> {
+        let check = |k: &str, v: &Value| -> Result<i64, String> {
             if !JITTER_CAPABLE.contains(&k) {
                 return Err(format!("任务 {k} 不支持随机延迟配置"));
             }
