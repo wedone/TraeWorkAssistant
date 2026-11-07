@@ -6,6 +6,56 @@
 
 ---
 
+## [1.6.0] · 2026-11-06 · 语义移植 main 864d3e5 => d04de4fc（池策略与可观测 + 工具别名 + 签到链路加固 + 审查修复）
+
+> 语义移植 main `864d3e5`（不含）=> `d04de4fc`（25 提交，未 merge）。跳过桌面/OS 专属：豆包全链路（probe 保活 / 签到时刻 / 前端页）、switcher/authfile 原子写、main.rs 窗口几何自愈、device_proxy msToken 脱敏、MultiSelectDropdown、版本号 chore 与 main 自身文档/merge 节点。
+
+### 新功能
+
+- **FairRotation 加权公平轮转（9a08c3a5，WB 池默认）**：按「积分消耗/权重」公平份额严格轮转（7 天内到期权重 2），闲置 ≥5min 饥饿保护优先；修复 expire_first 硬排序缺陷（到期账号恒优先 → 单账号连吃、无到期账号永久排队）。`wb_strategy` 空 = 公平轮转；Qoder / buddy-ai 池改回独立跟随 Trae 池，显式配置优先不变。配套余额差分记账（充值不回扣）、账本独立于 entries（池重建不丢份额）、记账后置到最终服务账号。
+- **WB 池一致性巡检热重载（9a08c3a5）**：网关 60s 比对「DB 装配指纹 ↔ 运行池指纹」，不一致即整池热重载，兜底直改库绕过热重载场景；扫码入池 oauth 同口径热重载。
+- **调度可观测（issue #186）**：503 `NoHealthy` 附逐池候选链与失败原因；`unavailable` 细分 `switch_off` / `no_source`；池内 0 账号附入池 hint；前端新增 fair_rotation 选项与「未入池账号」差额行。
+- **WB 族池工具名别名改写（3d2da631 + 077eda2d，issue #150 收尾）**：Buddy CN / BuddyAI Intl 三入口接入 `tool_alias_map`（请求侧正改 / 响应侧逆映射，11128 强制清洗重建后重做别名防失配）；默认别名表补 DSH 实证十一条。
+- **四池限流/耗尽徽标 + Retry-After 传播（issue #178）**：各账号页与到期看板实时展示 429 软冷却（秒级倒计时）、积分耗尽硬冷却、熔断；上游 429 带 Retry-After 时软冷却按其值生效（钳制 60s~7d）。
+- **WB 签到「待入账」+ 连签展示（issue #180）**：奖励次日到账不再误记「未识别」，次日按「billing 优先、credits 兜底」差值自动回填，前端 T+1 徽标；streak_days 区分活跃/签到连签。
+
+### 修复与加固
+
+- **指纹样本 developer 角色取样（d3411477，issue #99）**：system/developer 统一归一为系统提示——developer 承载系统提示时样本恒空串、生成规则全失效的根因修复；样本超 300 字符补 `…` 截断标记，前端仅补剥离逻辑（本分支已有等价实现）。
+- **Qoder 签到 BLOCKED 信任单列 + 单账号重试闭环（9a08c3a5 / f9df6823，issue #190）**：BLOCKED 形态不再误判「领取成功」，调度器/启动补签剔除自动重试；`fail_kind` 结构化归因落库回传、先落库再广播（次序颠倒会致徽标不出现）；前端 BLOCKED 归因徽标 + 仅 BLOCKED 账号露出重试按钮（跨进程锁幂等兜底）。
+- **看板/概述刷新反馈（f9df6823，issue #188）**：Dashboard 聚合各数据源真实装载结果，全部成功才弹刷新成功提示；BuddyOverview 强制走网络（SWR 缓存直回致「点了没反应」的根因）+ 防重入 + stale 回退明示。
+- **Buddy 积分解析加固（issue #179）**：包条目全树特征键收集、到期宽容解析、未知 Status fail-open 落诊断；空明细不覆盖历史明细。
+- **网关请求体上限 32MiB（issue #181）**：超限错误附 `AIWORK_MAX_BODY_BYTES` 自助指引。
+- **Qoder 视觉门控收窄（issue #182）**：`is_vl` 以 `supportsImages === true` 为准（fail-closed），非视觉模型仍明示拒绝。
+- **NaN 哨兵（issue #184）**：rate 为 NaN 的目录条目不再误判为零费率最优候选，降级候选同步排除。
+- **/v1/responses 降级可观测（issue #183）**：bg/longctx 降级改写落 app_log，与 dispatch 同口径。
+- **macOS 审查通用修复（4ef628e9）**：降级日志注明候选改写口径；流式图片拒绝文案区分两种原因；未知 Status 包不入「最近到期」汇总。
+- **杂项**：glm-5.3-flash 长上下文支持表补齐（12 模型）；应用最小宽度 1920→1280px（issue #172）；Qoder CN 文案统一；dispatchPresets Buddy 池空串语义随 fair_rotation 同步。
+- **app_settings 原子读改写（d04de4fc，审查修复）**：store 新增 `kv_update` 原语——读、改、写同一连接 Mutex 持锁区完成，消除「kv_get → 内存改 → kv_set」两段式之间他方写入被旧快照整体覆盖丢键的窗口；回调 Err 整体放弃写回（先校验后写语义）、Ok(false) 不写盘、读错误 fail-closed 上抛（空集会触发整份覆写的路径绝不静默当空集）；`settings_set` patch 合并改走 kv_update（doubao schtasks 签到时刻 / 探测路径兜底两处调用点桌面专属跳过）。
+- **Qoder 聚合路径视觉拒绝双文案（d04de4fc）**：目录显式声明不支持（supportsImages=false）与缺字段兜底分开表述，与流式路径口径对齐——统一报「is_vl=false」会误导用户以为目录声明错误去换模型，而非补目录声明。
+- **巡检线程 panic payload 记录（d04de4fc）**：panic 恢复时提取 &str/String payload 记入 app_log，便于事后归因；自愈重启与闸门释放本分支已有等价实现，仅补可观测缺量。
+- **既有等价实现无需移植（d04de4fc）**：FairRotation 无候选回退 sticky 记账（上次移植已含同题实现）、routes.rs Custom 池臂注释、wb_route Anthropic 聚合 tool_alias=None、wb_payload DSH 十一条守护测试、前端 fair_rotation 白名单、成对指纹一致性测试。
+
+### 验证
+
+- 2026-11-06：`cargo test --workspace`（aiwork-core 937 / aiwork-server 13 通过）、`npx tsc --noEmit`、`npx vitest run`（90 通过）全部通过。
+
+## [1.5.12] · 2026-11-02 · 语义移植 main f53e213a => 864d3e5（Buddy 积分口径 + 缓存对账）
+
+> 语义移植 main `f53e213a`（不含）=> `origin/main`（864d3e5，含 PR #166/#167/#168、issue #169 修复与 864d3e5 SWR 审查修复，未 merge）。跳过：PR #167 WorkBuddy 切换验证与 PR #168 模型趋势逐请求归属（均为桌面客户端逻辑——读本机切换器 auth 文件/客户端日志/vscdb 与 CodeBuddy IDE 会话文件，本分支无对应代码路径）；版本号 chore（本分支版本自管）。
+
+### 修复与加固
+
+- **SWR 单账号 uid 未命中回 None + 缓存自愈（864d3e5）**：`stale_reply` 单账号 uid 未命中缓存时原返回空列表 + refreshing，前端长期停在「无数据」假象（数据到位依赖后台刷新成功 + 前端重取，后台还有 120s 节流）——改回 None 交调用方同步拉取该账号，与函数内「全量空明细回 None」同一设计原则；单账号同步拉取（cached:false）后补触发节流后台全量刷新，该账号进缓存后后续同 uid 查询走 SWR 回旧值，不再每次重复 ≥3 次网络请求（spawn 内含 120s 节流 + 在途去重）。864d3e5 的快照防污染（`credits_refresh_now` 追加每日余额快照补 `uid.is_none()` 防护）本分支已先于 main 落实，无改动。
+- **Buddy 可用积分约 2 倍（PR #166 + 3418c95，修正 1.5.11 issue #120 口径）**：实测「平台奖励积分 / 套餐基础积分」等分类汇总行是同类明细包的**子集合计**（既不等于明细合计也不等于任何单条明细），1.5.11「汇总行值对不上明细时仍计入防漏算」在子集合计形态下必然漏杀，与明细并存即重复计入——汇总行与明细改共用同一跳过判定，确立「余额 ≡ 明细合计」不变量；无 code 真实包不再按值去重（同值可能是两个真实包，按值兜底会少计）。附子集合计/余额恒等明细合计回归测试。
+- **Buddy 体验版到期显示 2034/2035 年（PR #166）**：体验版按月下发（每月 1 日发放、次月 1 日 00:00 UTC+8 失效），上游到期字段给的是包本体约 10 年有效期——命中「体验版」的包到期改写为次月 1 日，按到期升序重排，7 日内标注「即将到期」。附跨年/月末重排测试。
+- **Buddy 积分明细每行「已用」恒 0.00（PR #166）**：上游分包多数不返回已用量，按「总量 − 剩余」倒推补齐展示（上游给了不覆盖）。
+- **统计页缓存口径补齐（issue #169，6da794c）**：看板网关源聚合缓存读取不再硬编码 0——WB/Qoder 池 cached_tokens 如实入账展示，Trae 池上游不下发即如实为 0（不伪造）；Trae 网关源新增第 5 张「账单口径缓存」对账卡（官网计费 cache_read 独立维度累计、天数按自然日去重、命中率分母同源取官网 input），转发与账单口径并排可对；API 服务页 Token 消耗卡有缓存落库时追加「缓存读取」展示。
+
+### 验证
+
+- `cargo test --workspace`（aiwork-core 902 通过 / aiwork-server 13 通过，含新增 wb_credits 回归 5 条）、`cargo check`（零警告）、`npx tsc --noEmit`、`npm test`（88 通过）全部通过。
+
 ## [1.5.11] · 2026-10-31 · 语义移植 main dfa6e02 => f53e213a
 
 > 语义移植 main `dfa6e02`（不含）=> `f53e213a`（4 提交含 1 merge，未 merge）。跳过：版本号 chore（本分支版本自管）、AGENT.md 与 main 自身 CHANGELOG（文档）、桌面 OS 专属；上下文窗口全链路本分支 1.5.10 已先行实现（仅补 #163 审查修复的并发防护），f53e213a 的 custom_route mock 整读加固与解冻相对秒大写归一化本分支已自研等价实现（含回归测试），不重复移植。

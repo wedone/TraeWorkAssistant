@@ -591,6 +591,8 @@ export interface PoolStatus {
   cooldown_reason: string | null;
   /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
   hard_credit?: boolean;
+  /** 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，显示恢复倒计时；旧后端未返回时为 undefined） */
+  hard_until?: number | null;
   disabled: boolean;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
@@ -605,7 +607,7 @@ export interface ApiPoolFile {
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
-  /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  /** Buddy 池调度策略（取值同 strategy）；空 = 加权公平轮转（fair_rotation，WB 专属默认，PR #187） */
   wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
@@ -627,7 +629,8 @@ export interface ApiPoolFile {
   buddy_ai_group_ids?: string[];
   /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
   buddy_ai_tag_ids?: string[];
-  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 qoder_strategy 语义；
+   *  wb_strategy 已改公平轮转专属默认，不在此列） */
   buddy_ai_strategy?: string;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
@@ -1232,6 +1235,8 @@ export interface WbCheckinRecord {
   message: string;
   /** 签到获得积分（接口返回或前后余额差值兜底） */
   reward?: number;
+  /** issue #180：积分次日到账（credit_delayed）待入账标记；T+1 回填后置 false */
+  reward_pending?: boolean;
 }
 
 /** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */
@@ -1334,6 +1339,9 @@ export interface QoderCheckinRecord {
   reward?: number;
   /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
   campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+  /** 失败归因（issue #190）：blocked_need_trust=风控信任未建立（需建信任后手动重试）；
+   * 历史记录无此字段 */
+  fail_kind?: string;
 }
 
 /** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
@@ -1353,6 +1361,9 @@ export interface QoderCheckinDone {
   failed: number;
   /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
   empty: number;
+  /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
+   * 自动重试无效（issue #190，口径对齐 Rust 侧） */
+  blocked: number;
 }
 
 export interface QoderCreditPackage {

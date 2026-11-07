@@ -11,7 +11,7 @@ import type { QoderAccountView, QoderCheckinRecord } from '../../types';
 /**
  * qoder-checkin 每日签到（F-80 §5.8，对照 BuddyCheckin 裁剪复刻）：
  * 签到控制卡（NDJSON 进度）+ 双活动说明卡。
- * 双活动：0 点刷新的 QoderWork 签到（100 Credits/天）+ 10:00 开窗的每日登录奖励
+ * 双活动：0 点刷新的 Qoder CN 签到（100 Credits/天）+ 10:00 开窗的每日登录奖励
  * （100 Add-on Credits/天）——接口层同源 sash campaigns，一次触发自然全覆盖。
  * 疑点⑦：签到进行态由 store 单例持有（qoder-checkin-progress 监听也在 store 层
  * setupListeners 注册），页面切走/卸载不丢事件，切回时进度/汇总完好。
@@ -260,11 +260,21 @@ export default function QoderCheckin() {
             {running ? (
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
-              <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
-                完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
-                {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
-                {earned > 0 && ` · 获得 ${earned} Credits`}
-              </Badge>
+              <div className="flex flex-col items-end gap-1">
+                <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
+                  完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
+                  {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
+                  {earned > 0 && ` · 获得 ${earned} Credits`}
+                </Badge>
+                {/* 风控拦截单列（issue #190）：BLOCKED 自动重试无效，需用户在
+                    客户端使用该账号建立服务端信任后手动重试——与普通失败混在
+                    「失败 N」里会引导用户无效重试 */}
+                {doneInfo.blocked > 0 && (
+                  <Badge tone="red" title="服务端按「账号×设备指纹」信任分桶拒绝本次领取；在工具内切换该账号同步指纹后打开客户端使用一次，再手动重试">
+                    {doneInfo.blocked} 个账号被风控拦截：请在客户端使用该账号建立信任后重试
+                  </Badge>
+                )}
+              </div>
             ) : null}
           </div>
           <div className="space-y-1">
