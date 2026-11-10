@@ -237,7 +237,13 @@ fn resp_send(tx: &Sender, event: &str, data: Value) {
 }
 
 /// 构造 Responses response 对象（created/in_progress/completed/failed 共用骨架）
-fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usage: Option<&Value>) -> Value {
+pub(crate) fn responses_object(
+    id: &str,
+    model: &str,
+    status: &str,
+    output: Vec<Value>,
+    usage: Option<&Value>,
+) -> Value {
     let mut obj = json!({
         "id": id,
         "object": "response",
@@ -529,8 +535,8 @@ pub fn stream_forward_ex(
                 if !has_content {
                     // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
-                    // 注：Responses 协议若已发 created（空 delta chunk 触发），换号
-                    // 重试会重复 created——影子风控场景上游通常零 chunk，属可接受边界
+                    // 注：Responses 协议 created 仅在载荷帧时下发（噪声帧门控），
+                    // 影子风控场景上游零载荷 chunk → 未发 created，换号重试干净
                     error_info = Some((
                         super::EMPTY_COMPLETION_CODE,
                         super::EMPTY_COMPLETION_MSG.to_string(),
@@ -552,6 +558,11 @@ pub fn stream_forward_ex(
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
                             send!(format!("event: error\ndata: {}\n\n", err));
+                            // 流尾合成收口（与 routes::send_stream_error_full 同口径）：
+                            // 仅 error 事件流未终止，等待收口的客户端会挂死；只补
+                            // message_stop 不发 message_delta（stop_reason 无「错误」
+                            // 官方枚举，严格 SDK 拒验）
+                            send!("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
                         }
                         crate::api_server::routes::Protocol::Responses => {
                             // 流内错误 → response.failed（Responses 无 [DONE] 帧）
@@ -796,10 +807,27 @@ pub fn stream_forward_ex(
                         }
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
                         crate::api_server::routes::Protocol::Responses => {
-                            resp_ensure_created!();
-                            // created 帧已下发：后续流内错误必须就地 response.failed，
-                            // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
-                            sent_any = true;
+                            // 审查修复（macOS #1）：噪声帧门控——纯噪声帧（空 delta、
+                            // 无 finish、无 usage）不再提前下发 created / 置 sent_any。
+                            // 原实现空 delta chunk 也触发 created：空完成换号重试失效
+                            // （调用方据 sent_any 误判「已发送数据」不再重试），且真
+                            // 换号会向已含 created 的流拼接第二份响应（与下方 P2-9
+                            // 注释矛盾）。审查修复（批次 2）：门控收窄到真实载荷帧
+                            // （正文/思考/工具调用任一非空，与 has_content 判据一致）
+                            // ——finish/usage-only 帧不再触发 created，否则「有 usage
+                            // 无内容」流会先发 created 再按空完成换号，客户端收到
+                            // 重复 created；收窄后不变式成立：created 已发 ⟺ 有内容
+                            // ⟺ 不会走空完成换号
+                            let frame_has_payload =
+                                delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("reasoning_content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("tool_calls").and_then(|t| t.as_array()).map_or(false, |a| !a.is_empty());
+                            if frame_has_payload {
+                                resp_ensure_created!();
+                                // created 帧已下发：后续流内错误必须就地 response.failed，
+                                // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
+                                sent_any = true;
+                            }
                             // 文本增量 → message 输出项 + output_text.delta
                             if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                                 if !resp_msg_open {
@@ -1456,6 +1484,43 @@ mod tests {
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.failed"));
         assert!(body.contains("中途失败"));
+    }
+
+    /// 审查修复（批次 2）：usage/finish-only 帧不得触发 created——「有 usage 无
+    /// 内容」流此前会先发 created（frame_has_payload 含 usage）再按空完成哨兵
+    /// 换号，客户端收到重复 created。门控收窄到真实载荷帧（与 has_content 判据
+    /// 一致）后不变式成立：created 已发 ⟺ 有内容 ⟺ 不会走空完成换号
+    #[test]
+    fn stream_forward_responses_usage_only_frame_does_not_emit_created() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_u", "m", &HashSet::new(), None);
+        assert_eq!(
+            err,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string()
+            )),
+            "零内容流仍按空完成哨兵换号重试"
+        );
+        assert!(!sent_any, "usage-only 帧不得置 sent_any（否则换号重试失效）");
+        assert!(!failed_inline);
+        assert!(usage.is_some(), "usage 仍应上抛供记账");
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(
+            !body.contains("event: response.created"),
+            "usage-only 帧不得提前下发 created：{body}"
+        );
     }
 
     /// 正常完成流：failed_inline 必须为 false（不得误报流内失败）

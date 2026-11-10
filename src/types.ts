@@ -297,7 +297,8 @@ export interface SanitizeSwitches {
 
 /** 网关命中（指纹拦截/空完成影子风控）落下的指纹样本：供一键生成清洗规则 */
 export interface FingerprintSample {
-  /** 11128 = 指纹拦截；empty = 空完成（影子风控收尾采样） */
+  /** "11128" = 清洗已启用仍被拦；"11128_cleaned" = 11128 终局同采的清洗后样本
+   * （进出对比诊断用，issue #195 第二轮）；"empty" = 空完成影子风控 */
   kind: string;
   /** wb | trae | qoder | buddy-ai */
   pool: string;
@@ -459,6 +460,42 @@ export interface CreditsDailySnapshot {
   /** 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1）；
    * 缺失/空 = 老快照行无账号明细（账号筛选时该日不计入过滤后合计） */
   accounts?: Record<string, number>;
+}
+
+/** F-84：网关单条请求的结构化视图（由当日文本日志行解析） */
+export interface ApiLogEntry {
+  /** 日志文件日期（YYYY-MM-DD） */
+  date: string;
+  /** 行首时间（HH:MM:SS） */
+  time: string;
+  method: string;
+  path: string;
+  /** 网关 API Key 展示名（匿名 = "-"） */
+  keyName: string;
+  /** 实际服务池（trae/buddy/buddy-ai/qoder/custom；调度早退行 = "-"） */
+  pool: string;
+  model: string;
+  /** 实际服务账号名（未取号 = "-"） */
+  acct: string;
+  /** 上游账号 uid 前 12 位 */
+  uid: string;
+  stream: boolean;
+  status: number;
+  durationMs: number;
+  /** TTFT（首字延迟，仅流式成功路径记录） */
+  ttfbMs?: number | null;
+  /** custom 池阶段标记 */
+  stage?: string | null;
+  /** 失败原因（落行管线既有脱敏口径） */
+  error?: string | null;
+}
+
+/** F-84：结构化「最近请求」分页结果 */
+export interface ApiLogRecentResult {
+  rows: ApiLogEntry[];
+  total: number;
+  /** true = 达到后端单次解析行数上限，total 仅统计已扫部分 */
+  truncated: boolean;
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----

@@ -219,7 +219,7 @@ fn resolve_wb_target(
 
 /// T5.3/F-62 默认深度思考：客户端未显式请求 effort 且无路由级提示时默认 high。
 /// `explicit_effort` 由调用方按协议判定（OpenAI: reasoning_effort 字段；Anthropic: thinking 参数）
-fn effective_effort_hint(
+pub(crate) fn effective_effort_hint(
     state: &ApiSharedState,
     route_hint: Option<String>,
     explicit_effort: bool,
@@ -238,7 +238,7 @@ fn effective_effort_hint(
 }
 
 /// 注入 effort 提示到请求体字节流（T5.2④/T5.3）
-fn apply_effort_hint(body_vec: Vec<u8>, hint: Option<String>) -> Vec<u8> {
+pub(crate) fn apply_effort_hint(body_vec: Vec<u8>, hint: Option<String>) -> Vec<u8> {
     wb_model_route::inject_effort_hint(&body_vec, &hint)
 }
 
@@ -1322,7 +1322,7 @@ pub async fn chat_completions(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
             }
@@ -1330,7 +1330,7 @@ pub async fn chat_completions(
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
                 // 无 effort/后缀预处理（思考档位由 resolve_thinking 按条目解析）
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
@@ -1347,7 +1347,7 @@ pub async fn chat_completions(
                     &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
-                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, r.fallback_chain)
                 } else {
                     aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
                 }
@@ -1499,7 +1499,7 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools)
+        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools, Vec::new())
     } else {
         wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, encoded_tools).await
     }
@@ -1698,14 +1698,14 @@ pub async fn messages(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
@@ -1732,7 +1732,7 @@ pub async fn messages(
                     &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
-                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, r.fallback_chain)
                 } else {
                     aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await
                 }
@@ -1853,14 +1853,14 @@ pub async fn completions(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
@@ -1872,7 +1872,7 @@ pub async fn completions(
                     &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
-                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, r.fallback_chain)
                 } else {
                     aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
                 }
@@ -2061,7 +2061,7 @@ pub(crate) fn trae_pool_constraints(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
+fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, fallback: Vec<super::dispatch::PoolCandidate>) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流。
@@ -2679,7 +2679,6 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用（空完成/传输掐断主导 → 明示对应归因，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) = exhaust_message_with_transport_cut(
@@ -2688,6 +2687,21 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
+        // 503 请求行前移到移交块之前（M-2 口径与 wb/qoder 三池同构：移交成功同样
+        // 留行 = 本池尝试记录）
+        state.logger.log_request(
+            "trae", "POST", proto.log_path(), &model, stream,
+            503, "none", duration_ms, &key_name, "",
+            Some(&exhaust_msg),
+        );
+        // F-81 跨池移交（Trae 目标第一期不支持，见 cross_pool 注释）。
+        // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落终态用量
+        //（含真实账号），本池不再补 "none" 行，避免同一请求两条用量行（双记账）
+        if !fallback.is_empty() && !tx.is_closed() {
+            let ok = super::cross_pool::continue_stream_on_next_pool(&state, "trae", &fallback, &body_vec, proto, &key_id, &chat_id, &tx, guard, &std::collections::HashSet::new(), start_ts);
+            if ok { return; }
+        }
+        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -2699,11 +2713,6 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 format!("{}({}:{},cr={}{}{}{})", d.name, d.uid.get(..8).unwrap_or(&d.uid), d.reason, credits_str, cd_str, exp_str, dis_str)
             })
             .collect();
-        state.logger.log_request(
-            "trae", "POST", proto.log_path(), &model, stream,
-            503, "none", duration_ms, &key_name, "",
-            Some(&exhaust_msg),
-        );
         // 写入 app.log 供排查
         {
             let now = std::time::SystemTime::now()
@@ -2723,47 +2732,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
-        match proto {
-            Protocol::OpenAi | Protocol::OpenAiText => {
-                let err_body = json!({
-                    "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "data: {}\n\n",
-                    err_body
-                ))));
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-            }
-            Protocol::Anthropic => {
-                let err = json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": exhaust_msg,
-                    },
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "event: error\ndata: {}\n\n",
-                    err
-                ))));
-            }
-            Protocol::Responses => {
-                let body = json!({
-                    "type": "response.failed",
-                    "response": {
-                        "id": format!("resp_{}", now_ts()),
-                        "object": "response",
-                        "status": "failed",
-                        "output": [],
-                        "error": {"code": "no_healthy_account", "message": exhaust_msg},
-                    },
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "event: response.failed\ndata: {}\n\n",
-                    body
-                ))));
-            }
-        }
+        // 审查修复（批次 2 复审）：统一走 send_stream_error_full——此前此处仍为
+        // 内联三臂旧形态（Responses 6 字段裸骨架缺 SDK 必读字段、Anthropic 臂
+        // 无合成收口），与 wb/qoder 耗尽出口不一致。code 保持字符串
+        // no_healthy_account 客户端兼容（main 审查 #7 口径，OpenAI 臂原值透传）
+        send_stream_error_full(&tx, proto, &model, json!("no_healthy_account"), &exhaust_msg);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -3720,48 +3693,81 @@ pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> 
 
 /// 流式错误统一下发：sse 层在流未开始时不透传错误（留待重试决策），
 /// 由此处按客户端协议格式化错误事件并收尾
+/// 统一流式错误帧下发核心（审查 #2 收敛：wb_route::send_stream_error_wb 与
+/// qoder_route::send_stream_error(_named) 均委托此实现，三池形态一致）
+pub(crate) fn send_stream_error_full(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    model: &str,
+    // 数字 HTTP 状态码（400/上游 status）或字符串业务码（no_healthy_account，
+    // 耗尽出口客户端兼容口径）——OpenAI 臂按原值透传不变形
+    code: serde_json::Value,
+    msg: &str,
+) {
+    // 空 message 兜底（issue #71）：字符串业务码无数字语义，仅用于空 message
+    // 的等级兜底（耗尽出口文案由 exhaust_message 构造、恒非空，不触达此兜底）
+    let msg = stream_msg_or_fallback(msg, code.as_i64().unwrap_or(0));
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+            // Anthropic 流尾合成收口（docker 审查 #2 同族）：仅 error 事件对
+            // Anthropic 客户端而言流未终止，等待收口的实现会挂死到客户端超时。
+            // 只补 message_stop 不发 message_delta——delta.stop_reason 无「错误」
+            // 官方枚举值（end_turn/max_tokens/stop_sequence/tool_use/refusal/
+            // pause_turn），合成值会被严格 SDK 拒验；event:error 已让 SDK 进入
+            // 错误分支，message_stop 仅负责终止流
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(concat!(
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))));
+        }
+        Protocol::Responses => {
+            // 取号失败/无健康账号等错误 → response.failed（Responses 无 [DONE] 帧）。
+            // 复用 responses_object 骨架保证字段集完整——openai 官方 SDK Response
+            // 模型对 created_at/model/parallel_tool_calls/tool_choice/tools 等有
+            // 必读要求（缺字段整帧反序列化失败被吞为连接错误，根因与 #73 同族）。
+            // model 缺省 ""：通用入口无模型上下文（字段在位即可通过 SDK 校验），
+            // 有模型上下文的调用方（wb 路径）经 send_stream_error_wb 传入真值
+            let ts = now_ts();
+            let mut resp = super::wb_sse::responses_object(
+                &format!("resp_{}", ts),
+                model,
+                "failed",
+                vec![],
+                None,
+            );
+            resp["error"] = json!({
+                "code": code.as_str().map(str::to_string).unwrap_or_else(|| code.to_string()),
+                "message": msg
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            // usage 门注释（审查 #2 同族）：本错误帧刻意不带 usage——错误帧的
+            // usage 不是记账信号；计费链路只在流成功收口时聚合入账
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+/// 流式错误帧下发（数字 code 便捷入口； Responses/Anthropic 收口加固统一在
+/// send_stream_error_full——custom_route/Trae/qoder 入口共用）
 pub(crate) fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: i64,
     msg: &str,
 ) {
-    let msg = stream_msg_or_fallback(msg, code);
-    match proto {
-        Protocol::OpenAi | Protocol::OpenAiText => {
-            let body = json!({
-                "error": { "message": msg, "type": "api_error", "code": code }
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-        Protocol::Anthropic => {
-            let err = json!({
-                "type": "error",
-                "error": { "type": "api_error", "message": msg },
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let body = json!({
-                "type": "response.failed",
-                "response": {
-                    "id": format!("resp_{}", now_ts()),
-                    "object": "response",
-                    "status": "failed",
-                    "output": [],
-                    "error": {"code": code.to_string(), "message": msg},
-                },
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-    }
+    send_stream_error_full(tx, proto, "", json!(code), msg);
 }
 
 fn now_ts() -> u64 {
@@ -4166,6 +4172,51 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    /// 统一错误帧出口（审查 #2 收敛后锁定行为）：Responses 臂复用 responses_object
+    /// 骨架带全官方 SDK 必读字段；Anthropic 臂 event:error 后仅以 message_stop 合成
+    /// 收口（不带 message_delta——stop_reason 无「错误」官方枚举，严格 SDK 拒验）
+    #[test]
+    fn send_stream_error_full_responses_skeleton_and_anthropic_stop_only() {
+        // Responses 臂：骨架字段集完整 + error 透传
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error(&tx, Protocol::Responses, 503, "上游不可用");
+        drop(tx);
+        let text =
+            String::from_utf8_lossy(&rx.try_recv().expect("Responses 臂应有一帧").unwrap()).to_string();
+        assert!(text.starts_with("event: response.failed\ndata: "), "{text}");
+        let data = text
+            .strip_prefix("event: response.failed\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("帧体应为 SSE data 行");
+        let body: serde_json::Value = serde_json::from_str(data).expect("应为合法 JSON");
+        let resp = &body["response"];
+        assert_eq!(resp["object"], "response");
+        assert_eq!(resp["status"], "failed");
+        assert!(resp["created_at"].is_number(), "created_at 为 SDK 必读字段");
+        assert!(resp["model"].is_string(), "model 为 SDK 必读字段（缺省空串）");
+        assert_eq!(resp["error"]["code"], "503");
+        assert!(rx.try_recv().is_err(), "Responses 臂应恰好一帧");
+
+        // Anthropic 臂：error + message_stop-only 合成收口
+        let (tx2, mut rx2) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error(&tx2, Protocol::Anthropic, 503, "上游不可用");
+        drop(tx2);
+        let f1 = String::from_utf8_lossy(&rx2.try_recv().expect("Anthropic 臂应有 error 帧").unwrap())
+            .to_string();
+        assert!(f1.starts_with("event: error\ndata: "), "{f1}");
+        let f2 = String::from_utf8_lossy(
+            &rx2.try_recv().expect("Anthropic 臂应有合成收口帧").unwrap(),
+        )
+        .to_string();
+        assert!(
+            f2.contains("event: message_stop") && !f2.contains("message_delta"),
+            "收口应仅含 message_stop（严格 SDK 兼容）：{f2}"
+        );
+        assert!(rx2.try_recv().is_err(), "Anthropic 臂应恰好两包");
     }
 
     /// 审查 C1 + issue #90 修复③a：池前缀模型按裸名准入（与 /v1/models 别名

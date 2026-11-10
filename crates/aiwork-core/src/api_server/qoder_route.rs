@@ -49,7 +49,7 @@ use super::wb_upstream::{
     ReadErrSlot, InterruptibleLines,
 };
 use super::{ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 use crate::tasks::qoder_common::QoderCreds;
 use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
 
@@ -673,7 +673,11 @@ fn translate_race_lines(
 
 // ==================== 流式入口 ====================
 
-/// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）
+/// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）。
+/// 审查 H-1：`encoded` 为 wb 侧 Responses 请求收集的工具 namespace 编码名集合，
+/// 随跨池移交全链透传——仅在 wb↔qoder 互移交场景非空（wb 受理 Responses 收集
+/// 后移交 qoder，qoder 再耗尽移交回 wb 时还原投影不丢）；qoder 自身协议不消费
+/// 该集合，仅透传
 pub fn qoder_stream_chat(
     state: Arc<ApiSharedState>,
     body_vec: Vec<u8>,
@@ -682,6 +686,8 @@ pub fn qoder_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -720,7 +726,7 @@ pub fn qoder_stream_chat(
             });
         }
 
-        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -732,8 +738,36 @@ pub fn qoder_stream_chat(
         .unwrap_or_else(|_| internal_error_response())
 }
 
+/// F-81：跨池移交尝试（流式两处耗尽收尾共用）。成功 = 剩余流已移交下一池
+///（调用方直接 return，不再发错误帧）；链空/客户端断连/全不支持 → false。
+/// 审查 H-1：`encoded` 随移交透传（wb→qoder 移交场景非空，回 wb 时还原投影用）
 #[allow(clippy::too_many_arguments)]
-fn run_qoder_stream(
+fn try_cross_pool(
+    state: &Arc<ApiSharedState>,
+    fallback: &[super::dispatch::PoolCandidate],
+    body_vec: &[u8],
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    guard: InflightGuard,
+    encoded: &std::collections::HashSet<String>,
+    start_ts: Instant,
+) -> bool {
+    if fallback.is_empty() || tx.is_closed() {
+        return false;
+    }
+    super::cross_pool::continue_stream_on_next_pool(
+        state, "qoder", fallback, body_vec, proto, key_id, chat_id, tx, guard,
+        encoded, start_ts,
+    )
+}
+
+/// Qoder 池流式执行核心（qoder_stream_chat 直受理 / cross_pool 移交目标共用）。
+/// `encoded` 为 wb 侧编码工具名集合（H-1）：仅随跨池移交链透传，qoder 协议
+/// 自身不消费；移交耗尽回 wb 时原样带回，保 Responses 回程投影不丢
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_qoder_stream(
     state: &Arc<ApiSharedState>,
     body_vec: &[u8],
     model: &str,
@@ -743,6 +777,8 @@ fn run_qoder_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
@@ -927,7 +963,6 @@ fn run_qoder_stream(
         // 分支取号失败路径统一拼装，tried 非空保证healthy 统计口径正确）
         if !tried.is_empty() && Instant::now() > rotate_deadline {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
             let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
             let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
             let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
@@ -954,15 +989,26 @@ fn run_qoder_stream(
             // （指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步，不再从零试探
             super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-            state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
-                tried.len(),
-                empty_hits,
-                cut_hits,
-            ));
+            // 样例非空才落调试行（docker 审查 #2 同族）：空样例行无增量信息，
+            // 空完成洪峰下纯噪声刷屏干扰真实日志定位
+            if !sample_note.is_empty() {
+                state.logger.log_debug_line(format!(
+                    "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                    tried.len(),
+                    empty_hits,
+                    cut_hits,
+                ));
+            }
             // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
             // response.failed，不再裸 data: 帧不可读）；code 保持字符串
             // "no_healthy_account"（客户端兼容）
+            // F-81 跨池移交：链非空 → 下一池接管剩余流（503 账面行保留=本池
+            // 尝试记录，移交成功同样留行）。审查 A-1：usage 行后置到移交失败
+            // 之后——移交成功由接收池落终态用量，避免双记账
+            if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
+                return;
+            }
+            state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
             send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
             return;
         }
@@ -1003,7 +1049,6 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
@@ -1029,13 +1074,23 @@ fn run_qoder_stream(
                     // （kind=empty），返回日志注记供反查漏网触发句
                     let sample_note =
                         super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-                    state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
-                        tried.len(),
-                        empty_hits,
-                        cut_hits,
-                    ));
+                    // 样例非空才落调试行（docker 审查 #2 同族，同上口径）
+                    if !sample_note.is_empty() {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
+                            tried.len(),
+                            empty_hits,
+                            cut_hits,
+                        ));
+                    }
                     // 按客户端协议分流错误帧（同预算耗尽收尾口径）
+                    // F-81 跨池移交：链非空 → 下一池接管剩余流（503 账面行保留=
+                    // 本池尝试记录，移交成功同样留行）。审查 A-1：usage 行后置到
+                    // 移交失败之后——移交成功由接收池落终态用量，避免双记账
+                    if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
+                        return;
+                    }
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
                     send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }
@@ -1227,12 +1282,13 @@ fn run_qoder_stream(
                     let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
-                    // Qoder 无 namespace 展平编码（F4 移植）→ 空集合禁用编码名拆分
                     let (error_info, sent_any, failed_inline, usage) =
-                        // Qoder 无 namespace 展平编码（Responses 分支为防御性兜底，
-                        // 实际仅 OpenAi/Anthropic 可达）→ 空集合禁用编码名拆分（审查 F4）
+                        // 透传 encoded（审查 F4 收口）：Qoder 直受理入口传空集，
+                        // 跨池移交进来的请求携带真实集合，回程投影闸门即刻生效。
+                        // 当前 Responses 恒由 wb 受理且移交链恒空，此为防御性预留
+                        // ——未来接入 dispatch 建链时无需再改此处
                         wb_sse::stream_forward_ex(
-                            ilines, tx, proto, chat_id, model, &std::collections::HashSet::new(),
+                            ilines, tx, proto, chat_id, model, encoded,
                             tool_alias.as_ref(),
                         );
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
@@ -2426,82 +2482,30 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// 流内错误帧下发（自抄 send_stream_error_wb：私有不可复用；形态同构）
+/// 流内错误帧下发（审查 #2 收敛：统一委托 routes::send_stream_error——Responses
+/// 骨架与 Anthropic message_stop 收口加固随 routes 侧实现三池一致）
 fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: i64,
     msg: &str,
 ) {
-    let msg = stream_msg_or_fallback(msg, code);
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let resp = json!({
-                "id": format!("resp_{}", now_ts()),
-                "object": "response",
-                "status": "failed",
-                "output": [],
-                "error": {"code": code.to_string(), "message": msg},
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    crate::api_server::routes::send_stream_error(tx, proto, code, msg);
 }
 
 /// 字符串 code 变体（轮换耗尽收尾专用）：错误 code 保持字符串 "no_healthy_account"
-/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。三协议分流形态同构
-/// send_stream_error；耗尽文案 exhaust_message 恒非空，空 msg 兜底用 code
+/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。统一委托
+/// routes::send_stream_error_full；耗尽文案 exhaust_message 恒非空，空 msg 兜底
+/// 走 full 的等级兜底（code 无数字语义按业务码处理）
 fn send_stream_error_named(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: &str,
     msg: &str,
 ) {
+    // 空 message 兜底沿用原口径：文案用 code 字符串本身（非 full 的等级兜底）
     let msg = if msg.trim().is_empty() { code } else { msg };
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let resp = json!({
-                "id": format!("resp_{}", now_ts()),
-                "object": "response",
-                "status": "failed",
-                "output": [],
-                "error": {"code": code, "message": msg},
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    crate::api_server::routes::send_stream_error_full(tx, proto, "", serde_json::json!(code), msg);
 }
 
 fn internal_error_response() -> Response {

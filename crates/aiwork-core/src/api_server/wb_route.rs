@@ -36,7 +36,7 @@ use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 
 // ==================== wb 族执行视图（buddy-ai 阶段 2 分流） ====================
 
@@ -500,6 +500,54 @@ pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
     wb_payload::merged_tool_alias_rules(custom)
 }
 
+/// 11128 终局统一落样本（issue #195 第二轮审查④抽公共 helper，六处 Fatal 站点
+/// 口径一致）：指纹样本+本次命中流水日志、显式/清洗后两条样本入环形缓冲、
+/// 池级指纹短记忆标记、清洗后残留自检。样本由调用点取（来源各异：请求原文
+/// body_vec / chat_body 序列化），按请求去重守卫（last_11128_sample）与终局
+/// 说明（清洗后仍命中=模板需更新 vs 内容已流出=不可同号重试）留在调用点
+fn log_and_record_11128(
+    state: &WbView,
+    sample: &str,
+    converted: &[u8],
+    tool_alias_rules: &[(String, String)],
+    hit_cursor: u64,
+) {
+    let note = wb_payload::template_hit_note();
+    // 本次请求实际命中（issue #195 方案 B5）：游标之后的模板/别名命中流水，
+    // 替代进程级累计值的误导性
+    let per_req = wb_payload::template_hits_since(hit_cursor);
+    let per_req_note = if per_req.is_empty() {
+        String::new()
+    } else {
+        format!("；本次命中: {}", per_req.join(", "))
+    };
+    state
+        .logger
+        .log_sched_event(&format!("11128 指纹样本: {}{}{}", sample, note, per_req_note));
+    // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+    wb_payload::record_fingerprint_sample("11128", state.pool_label(), sample, &note);
+    // 清洗后样本（issue #195 方案 B2）：原样与清洗产物同落「指纹样本」环形缓冲，
+    // 进出对比漏网现形
+    let cleaned = wb_payload::fingerprint_sample(converted);
+    state
+        .logger
+        .log_sched_event(&format!("11128 清洗后指纹样本: {cleaned}{per_req_note}"));
+    wb_payload::record_fingerprint_sample("11128_cleaned", state.pool_label(), &cleaned, &note);
+    // issue #195：显式 11128 与空完成主导同视为渠道指纹确认，标记池级短记忆
+    // ——TTL 内同池新请求首轮即激进起步（prepare 末参经 fp_block_recent 生效），
+    // 不再每次都先吃一次 11128 才升级
+    wb_payload::mark_channel_fp_block(state.pool_label(), true);
+    // 清洗后残留自检（issue #195 可观测性，方案 B3 扩展到 tools 维度）：给出
+    // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面
+    if let Some(res) =
+        wb_payload::residual_fingerprint_note_rules_bytes(converted, tool_alias_rules)
+    {
+        state
+            .logger
+            .log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+    }
+}
+
 // ==================== 错误分类（WB 上游） ====================
 
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
@@ -829,6 +877,7 @@ pub fn wb_stream_chat(
     key_id: String,
     guard: InflightGuard,
     encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -875,7 +924,7 @@ pub fn wb_stream_chat(
 
         // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
         let view = WbView::new(state, buddy_ai);
-        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -893,7 +942,7 @@ pub fn wb_stream_chat(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_wb_stream(
+pub(crate) fn run_wb_stream(
     state: &WbView,
     body_vec: &[u8],
     model: &str,
@@ -904,6 +953,7 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
     encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -925,6 +975,10 @@ fn run_wb_stream(
     // 而 tools=[ask_user_question,create_goal,...] 全为原名）。与 Trae/Qoder 池同表
     // 复用 kv `tool_alias_map`（工具集指纹是上游风控家族共性，分档无收益）。
     let tool_alias_rules = load_tool_alias_rules(state);
+    // 本次请求命中流水游标（issue #195 方案 B5）：请求首个 prepare 前取快照，
+    // 11128 Fatal 落样本时导出之后的命中清单——样本行附带「本次实际命中」
+    // 而非进程级累计值
+    let hit_cursor = wb_payload::template_hits_mark();
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
@@ -1008,7 +1062,6 @@ fn run_wb_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
@@ -1042,6 +1095,10 @@ fn run_wb_stream(
                     // （kind=empty，样本 = 清洗前原始请求体），返回日志注记供反查
                     let sample_note =
                         wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
+                    // main 审查 #8 修正：本行是 diag_summary（逐账号不可用原因）在
+                    // wb 路径的唯一落点——上方 log_request 的 exhaust_msg 仅含聚合计
+                    // 数与归因语义、不含 reasons，故整行保持无条件落账，不随指纹样本
+                    // 一并门控（qoder 路径行不含 reasons，其门控口径不受影响）
                     state.logger.log_debug_line(format!(
                         "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
@@ -1051,13 +1108,25 @@ fn run_wb_stream(
                         diag_summary.join(", "),
                         sample_note,
                     ));
-                    let err_body = json!({
-                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                    });
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {err_body}\n\n"
-                    ))));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 按客户端协议分流错误帧（main 审查 #7，对齐 qoder 客户端口径）：
+                    // Anthropic 收 event: error、Responses 收 response.failed、OpenAI
+                    // 系维持 data: 帧——统一走 send_stream_error_wb（docker 侧加固
+                    // 同款：Anthropic 合成收口、Responses 复用 responses_object 骨架）；
+                    // message 均为 exhaust_msg，code 保持字符串 no_healthy_account
+                    // 客户端兼容（main 口径）
+                    // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
+                    // 周期交给下一池（guard move；503 账面行保留=本池尝试记录；
+                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾。
+                    // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落
+                    // 终态用量（含真实账号），本池不再补 "none" 行，避免同一请求
+                    // 两条用量行（双记账）
+                    if !fallback.is_empty() && !tx.is_closed() {
+                        if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
+                            return;
+                        }
+                    }
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
+                    send_stream_error_wb(tx, proto, model, json!("no_healthy_account"), &exhaust_msg);
                     return;
                 }
             },
@@ -1116,7 +1185,9 @@ fn run_wb_stream(
         // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
         // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
         if sanitize {
-            if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+            if let Some(note) =
+                wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+            {
                 if last_residual_note.as_deref() != Some(note.as_str()) {
                     last_residual_note = Some(note.clone());
                     state.logger.log_debug_line(format!(
@@ -1294,23 +1365,9 @@ fn run_wb_stream(
                                 // Fatal 终局：样本按请求最多落一次（落完即 return，
                                 // 无需按请求去重）
                                 let sample = wb_payload::fingerprint_sample(body_vec);
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}", sample, note
-                                ));
-                                wb_payload::record_fingerprint_sample(
-                                    "11128", state.pool_label(), &sample, &note,
+                                log_and_record_11128(
+                                    state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：显式 11128 与空完成主导同视为渠道指纹
-                                // 确认，标记池级短记忆——TTL 内同池新请求首轮即激进
-                                // 起步（prepare 末参经 fp_block_recent 生效），不再
-                                // 每次都先吃一次 11128 才升级
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                // 清洗后残留自检（issue #195 可观测性）：给出清洗产物
-                                // 仍命中的已知特征词，缩小漏网触发句排查面
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 // 终局说明（审查修复：区分两种不可重试情形——清洗后
                                 // 仍命中=模板需更新；内容已流出=不可同号重试）
                                 if sanitize {
@@ -1337,7 +1394,7 @@ fn run_wb_stream(
                                     duration_ms, Some(ttfb_ms), &key_name,
                                     &state.route_pool().name_of(win_uid), Some(&fatal_msg),
                                 );
-                                send_stream_error_wb(tx, proto, 400, &fatal_msg);
+                                send_stream_error_wb(tx, proto, model, json!(400), &fatal_msg);
                                 return;
                             }
                             let kind = classify_wb_error(code, &msg);
@@ -1433,23 +1490,9 @@ fn run_wb_stream(
                         let sample = wb_payload::fingerprint_sample(body_vec);
                         if last_11128_sample.as_deref() != Some(sample.as_str()) {
                             last_11128_sample = Some(sample.clone());
-                            let note = wb_payload::template_hit_note();
-                            state.logger.log_sched_event(&format!(
-                                "11128 指纹样本: {}{}",
-                                sample, note
-                            ));
-                            // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                            wb_payload::record_fingerprint_sample(
-                                "11128",
-                                state.pool_label(),
-                                &sample,
-                                &note,
+                            log_and_record_11128(
+                                state, &sample, &converted, &tool_alias_rules, hit_cursor,
                             );
-                            // issue #195：池级短记忆标记 + 清洗后残留自检（口径同流内 Fatal）
-                            wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                            if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                            }
                             // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
                             state.logger.log_sched_event(
                                 "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -1541,7 +1584,7 @@ fn run_wb_stream(
                                 &key_name, &state.route_pool().name_of(&picked.uid),
                                 Some(&msg),
                             );
-                            send_stream_error_wb(tx, proto, status as i64, &msg);
+                            send_stream_error_wb(tx, proto, model, json!(status as i64), &msg);
                             return;
                         }
                     }
@@ -1591,6 +1634,8 @@ pub async fn wb_aggregate_chat(
         // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
         // 与 wb_stream_chat 同口径（详见该入口注记）
         let tool_alias_rules = load_tool_alias_rules(&state);
+        // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+        let hit_cursor = wb_payload::template_hits_mark();
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
@@ -1733,7 +1778,9 @@ pub async fn wb_aggregate_chat(
             }
             // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
             if sanitize {
-                if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                if let Some(note) =
+                    wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+                {
                     if last_residual_note.as_deref() != Some(note.as_str()) {
                         last_residual_note = Some(note.clone());
                         state.logger.log_debug_line(format!(
@@ -1865,19 +1912,9 @@ pub async fn wb_aggregate_chat(
                                     // Fatal 终局：样本按请求最多落一次（落完即
                                     // return，无需按请求去重）
                                     let sample = wb_payload::fingerprint_sample(&body_vec);
-                                    let note = wb_payload::template_hit_note();
-                                    state.logger.log_sched_event(&format!(
-                                        "11128 指纹样本: {}{}", sample, note
-                                    ));
-                                    wb_payload::record_fingerprint_sample(
-                                        "11128", state.pool_label(), &sample, &note,
+                                    log_and_record_11128(
+                                        &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                     );
-                                    // issue #195：池级短记忆标记 + 清洗后残留自检
-                                    //（口径同流式 Fatal）
-                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -1962,24 +1999,9 @@ pub async fn wb_aggregate_chat(
                             let sample = wb_payload::fingerprint_sample(&body_vec);
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}",
-                                    sample, note
-                                ));
-                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                                wb_payload::record_fingerprint_sample(
-                                    "11128",
-                                    state.pool_label(),
-                                    &sample,
-                                    &note,
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：池级短记忆标记 + 清洗后残留自检
-                                //（口径同流式 Fatal）
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2165,6 +2187,8 @@ pub async fn wb_tool_exec_chat(
         // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
         // 与 wb_stream_chat 同口径（详见该入口注记）
         let tool_alias_rules = load_tool_alias_rules(&state);
+        // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+        let hit_cursor = wb_payload::template_hits_mark();
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         // P1-6 劫持防护：false = 客户端已声明同名 function 工具，未注入代理工具，
         // 全程跳过代执行（客户端工具调用照常透传，由客户端自行执行）
@@ -2280,7 +2304,9 @@ pub async fn wb_tool_exec_chat(
                 };
                 // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
                 if sanitize {
-                    if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                    if let Some(note) =
+                        wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+                    {
                         if last_residual_note.as_deref() != Some(note.as_str()) {
                             last_residual_note = Some(note.clone());
                             state.logger.log_debug_line(format!(
@@ -2349,19 +2375,9 @@ pub async fn wb_tool_exec_chat(
                                 );
                                 if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                     last_11128_sample = Some(sample.clone());
-                                    let note = wb_payload::template_hit_note();
-                                    state.logger.log_sched_event(&format!(
-                                        "11128 指纹样本: {}{}", sample, note
-                                    ));
-                                    wb_payload::record_fingerprint_sample(
-                                        "11128", state.pool_label(), &sample, &note,
+                                    log_and_record_11128(
+                                        &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                     );
-                                    // issue #195：池级短记忆标记 + 清洗后残留自检
-                                    //（口径同流式/聚合 Fatal）
-                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -2500,24 +2516,9 @@ pub async fn wb_tool_exec_chat(
                             );
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}",
-                                    sample, note
-                                ));
-                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                                wb_payload::record_fingerprint_sample(
-                                    "11128",
-                                    state.pool_label(),
-                                    &sample,
-                                    &note,
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：池级短记忆标记 + 清洗后残留自检
-                                //（口径同流式/聚合 Fatal）
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2776,40 +2777,15 @@ pub async fn wb_tool_exec_chat(
 fn send_stream_error_wb(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
-    code: i64,
+    model: &str,
+    // 数字 HTTP 状态码（400/上游 status）或字符串业务码（no_healthy_account，
+    // 池耗尽出口 main 审查 #7 客户端兼容口径）——OpenAI 臂按原值透传不变形
+    code: serde_json::Value,
     msg: &str,
 ) {
-    // 空 message 兜底（issue #71）：与 routes/qoder 的 send_stream_error 同防线
-    let msg = stream_msg_or_fallback(msg, code);
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            // 取号失败/无健康账号等入口错误 → response.failed（Responses 无 [DONE] 帧）
-            let resp = json!({
-                "id": format!("resp_{}", now_ts()),
-                "object": "response",
-                "status": "failed",
-                "output": [],
-                "error": {"code": code.to_string(), "message": msg},
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    // 统一实现收敛到 routes::send_stream_error_full（审查 #2：wb/qoder/routes
+    // 三套同构实现合一，Responses 骨架与 Anthropic 收口加固三池一致）
+    crate::api_server::routes::send_stream_error_full(tx, proto, model, code, msg);
 }
 
 fn internal_error_response() -> Response {
@@ -2878,6 +2854,150 @@ fn write_back_acc_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 池耗尽/取号失败 Responses 错误帧字段集：官方 SDK Response 模型对
+    /// created_at/model/parallel_tool_calls 等有必读要求（审查 #2 先补 created_at
+    /// 只补一半，缺 model 仍整帧反序列化失败被吞为连接错误），必须复用
+    /// responses_object 骨架保证字段完整，且错误帧不带 usage
+    #[test]
+    fn send_stream_error_wb_responses_frame_carries_sdk_required_fields() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "glm-5.3-flash",
+            json!(503),
+            "无健康账号",
+        );
+        drop(tx);
+        let frame = rx.try_recv().expect("Responses 臂应发出恰好一帧");
+        let text = String::from_utf8_lossy(&frame.unwrap()).to_string();
+        assert!(
+            text.starts_with("event: response.failed\n"),
+            "帧头应为 response.failed 事件：{text}"
+        );
+        let data = text
+            .strip_prefix("event: response.failed\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("帧体应为 SSE data 行");
+        let body: serde_json::Value = serde_json::from_str(data).expect("data 应为合法 JSON");
+        assert_eq!(body["type"], "response.failed");
+        let resp = &body["response"];
+        assert_eq!(resp["object"], "response");
+        assert_eq!(resp["status"], "failed");
+        assert_eq!(resp["model"], "glm-5.3-flash");
+        assert!(resp["created_at"].is_number(), "created_at 为 SDK 必读字段");
+        assert_eq!(resp["parallel_tool_calls"], true);
+        assert_eq!(resp["tool_choice"], "auto");
+        assert!(resp["tools"].is_array());
+        assert!(resp["output"].is_array());
+        assert_eq!(resp["error"]["code"], "503");
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("无健康账号"),
+            "error.message 应承载错误详情"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "错误帧只发一次，且不带 usage/[DONE] 收尾"
+        );
+    }
+
+    /// 池耗尽出口（main 审查 #7）：code 保持字符串 no_healthy_account 客户端兼容
+    /// ——OpenAI 臂 data 帧字符串 code 原样透传 + [DONE] 收尾；Responses 臂
+    /// error.code 直通字符串；Anthropic 臂 event: error 后补 message_stop 合成
+    /// 收口（docker 审查 #2 同族，防等待收口的客户端挂死）。审查修复（批次 2）：
+    /// 收口不再带 message_delta——delta.stop_reason 无「错误」官方枚举值，合成值
+    /// 会被严格 SDK 拒验；event:error 已进入错误分支，message_stop 仅终止流
+    #[test]
+    fn send_stream_error_wb_string_code_and_anthropic_closure() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+
+        // OpenAI 臂：字符串 code 原样透传 + [DONE] 收尾
+        send_stream_error_wb(
+            &tx,
+            crate::api_server::routes::Protocol::OpenAi,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx);
+        let frame = String::from_utf8_lossy(&rx.try_recv().expect("OpenAI 臂应有错误帧").unwrap())
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(
+            frame
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\n"))
+                .expect("帧体应为 SSE data 行"),
+        )
+        .expect("data 应为合法 JSON");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["code"], "no_healthy_account",
+            "字符串 code 必须原样透传（客户端兼容口径）"
+        );
+        let done = String::from_utf8_lossy(
+            &rx.try_recv()
+                .expect("OpenAI 臂应有 [DONE] 收尾")
+                .unwrap(),
+        )
+        .to_string();
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert!(rx.try_recv().is_err(), "OpenAI 臂应恰好两帧");
+
+        // Responses 臂：字符串 code 直通 error.code（as_str 分支）
+        let (tx2, mut rx2) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx2,
+            crate::api_server::routes::Protocol::Responses,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx2);
+        let f2 = String::from_utf8_lossy(&rx2.try_recv().expect("Responses 臂应有错误帧").unwrap())
+            .to_string();
+        let body2: serde_json::Value = serde_json::from_str(
+            f2.strip_prefix("event: response.failed\ndata: ")
+                .and_then(|rest| rest.strip_suffix("\n\n"))
+                .expect("帧体应为 SSE data 行"),
+        )
+        .expect("data 应为合法 JSON");
+        assert_eq!(body2["response"]["error"]["code"], "no_healthy_account");
+
+        // Anthropic 臂：error + message_stop 合成收口（不带 message_delta——
+        // delta.stop_reason 无「错误」官方枚举值，严格 SDK 会拒验）
+        let (tx3, mut rx3) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx3,
+            crate::api_server::routes::Protocol::Anthropic,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx3);
+        let f3 = String::from_utf8_lossy(&rx3.try_recv().expect("Anthropic 臂应有 error 帧").unwrap())
+            .to_string();
+        assert!(f3.starts_with("event: error\ndata: "), "首帧应为 error 事件：{f3}");
+        let f4 = String::from_utf8_lossy(
+            &rx3.try_recv()
+                .expect("Anthropic 臂应有合成收口帧")
+                .unwrap(),
+        )
+        .to_string();
+        assert!(
+            f4.contains("event: message_stop") && f4.contains("\"type\":\"message_stop\""),
+            "收口包应含 message_stop 终止事件：{f4}"
+        );
+        assert!(
+            !f4.contains("message_delta"),
+            "收口不得带 message_delta（stop_reason 无错误枚举，严格 SDK 拒验）：{f4}"
+        );
+        assert!(rx3.try_recv().is_err(), "Anthropic 臂应恰好两包");
+    }
 
     #[test]
     fn merge_transport_cut_info_overrides_placeholder_only() {

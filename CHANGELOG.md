@@ -6,6 +6,69 @@
 
 ---
 
+## [1.6.4] · 2026-11-10 · 语义移植 main afe1966 => 63c354f（3 提交）
+
+> 语义移植 afe1966（issue #198 批次）及其后 2 提交（2b87e1a 网关审查修复批次、63c354f DSH 11128 三轮审查加固），未 merge；跳过桌面/OS 专属项：更新包下载信任锚（updater 桌面更新器专属）、workbuddy_atrest 解密层与客户端密钥探针、App.tsx 静默更新、tauri proxy_logs_list 命令（docker 无 ProxyLogsTab，logsRecent 已支持 days 透传）、账号页帮助弹窗滚动高度；cmd_bridge 异步化由既有 spawn_blocking 结构性覆盖，无须移植。
+
+### 新功能
+- **工具别名前缀通配规则**：`from` 以 `*` 结尾按前缀替换语义生效（内置布防 `acp_*→tool_`，ACP 桥接命名族无须逐一布防）；精确规则优先于通配；生成名与存活真实名碰撞/恒等改写一律跳过；冲突否决回滚后名字仍可被后续规则接管（链式回归锁定）；停用规则（to=null）落空 to 占位并阻断通配接管；`tool_alias_map_set_at` 落库拒绝裸 `*`。
+- **11128 诊断闭环升级（issue #195）**：六处 Fatal 站点收敛到 `log_and_record_11128` 公共 helper（指纹样本 + 本次命中流水 + 池级短记忆 + 残留自检口径一致），清洗后样本同采（`11128_cleaned` Badge，进出对比漏网现形）；本次请求命中流水改 `template_hits_mark`/`template_hits_since` 游标（环形缓冲 4096），样本行附带「本次实际命中」而非进程级历史累计，别名命中以「别名」前缀区分；残指纹自检扩展 tools 维度（工具名特征词、`acp_` 前缀残留、别名 from 清洗后仍存活，去重保序）；样本工具名改全量落样（原前 10 截断，40 工具集 29 个名字永不可观测）。
+- **WB/CodeBuddy 新版 auth 文件字段级加密识别（issue #198）**：客户端升级（WorkBuddy 5.9+ / CodeBuddy CN 4.12+）后 auth 文件敏感字段为 `$wbEncrypted` 字段级加密包裹，原解析误报「值为 object/结构变更」；现报「字段级加密形态」明确错误并引导提供明文 auth 文件 / OAuth 接入（Web/Docker 形态无本机探针能力，不解密）。
+
+### 修复与加固
+- **Buddy 签到页稀疏数组崩溃**：日历格子按 index 直接赋值在越界日期产生稀疏数组，后续遍历崩溃——改 upsert + 排序。
+- **最近请求日志加固**：解析字段锚清洗内嵌 ZWSP（保留前缀空格防伪锚）+ 行级锚防注入，uid/密钥/账号/模型/请求响应体等日志值全量 sanitize；查询 result 未知值前置校验、days 对齐自然日窗口、扫描预检上限 256MB、解析行上限 30 万→80 万；api_logger 队列超 1 万行丢最旧、日志写失败 stderr 观测（原静默丢弃）；API 日志日期列表对畸形文件名按 `valid_date` 同口径过滤（防可点恒空的死条目）。
+- **跨池移交记账收口**：wb/qoder 耗尽路径 usage 记账后置到移交失败之后（防移交成功双记账）；trae 耗尽日志前移（含真实终局）；qoder 分支补 `encoded` 透传（tool_alias 跨池保持生效）；粘性命中也按绑定序/模型序/优先级收集降级链（Custom 胜出不收链，链去重）。
+
+### 验证
+- `cargo test --workspace`（989+13 通过 / 0 失败 / 8 忽略，含 issue #195 通配与命中流水 9 条、issue #198 加密识别 3 条新回归）/ `cargo check --all-targets` 零警告 / `tsc --noEmit` 零错误 / `vitest`（90 用例）全部通过。
+
+---
+
+## [1.6.3] · 2026-11-08 · 语义移植 main bfa0bc2 => dffcecc
+
+> 语义移植 3.9.2 两提交；跳过桌面/OS 专属项（schtasks 唤醒、Trae 凭证直读、静默更新链路）。
+
+### 新功能
+- **跨池重试第一期（F-81）**：调度时收集健康池候选链，流式耗尽按序移交下一池（wb/qoder/trae 收尾接入）；Responses 管线与聚合路径留待第二期。
+- **结构化请求日志（F-84）**：日志页新增「最近请求」双视图（池/结果筛选、TTFT、分页）；查询命令改只读实例，顺带修复 flusher 线程泄漏。
+- **客户端配置示例（F-83）**：接口配置页升级六客户端 Tab（OpenAI/Claude Code/Codex/Cline/Continue/Roo）；模型目录与网关帮助弹窗支持逐行复制接入配置。
+
+### 修复
+- logsSearch 发送 snake_case 键名被 Rust 端静默忽略，时间段过滤从未生效——改发 camelCase。
+- 日志读取命令的 date 参数加 `YYYY-MM-DD` 字面校验（阻断 `../` 路径穿越读任意 .log 文件；回归 `read_log_rejects_non_date_input`）。
+
+### 验证
+- `cargo test`（971+13）/ `cargo check` 零警告 / `tsc --noEmit` / `vitest` 全部通过。
+
+## [1.6.2] · 2026-11-08 · 语义移植 main 245a611 => bfa0bc2
+
+> 语义移植 1 实质提交（网关流式守卫与豆包并发落库加固批次，未 merge）；跳过豆包全链路、switcher/env 桌面专属等不适用项。
+
+### 修复与加固
+
+- **SSE 迟到事件守卫补全**：done 收口后迟到 error 静默忽略（OpenAI chat / legacy text / Anthropic），防已完整交付的请求被迟到错误误落账/误冷却。
+- **WB 池错误帧按协议分流**：11128 Fatal / 流内错误 / 池预算耗尽统一走 `send_stream_error_wb`（数字状态码透传、耗尽保持字符串 code）；Anthropic 补合成收口、Responses 错误帧补齐 SDK 必读字段。
+- **Responses 噪声帧门控**：纯噪声帧不再提前下发 created / 置 sent_any，空完成换号重试恢复。
+- **custom_route probe 整体 20s 超时**：慢滴上游分项超时拦不住，整体超时确保探测收敛。
+- **wb_payload 残留自检**：补 DSH 模型句特征词组。
+- **qoder_route 空完成调试行门控**：`sample_note` 非空才落，空完成洪峰不刷屏。
+- **kv_update 事务竞态容错**：回滚清场遇「事务已自行结束」不再误报连接损坏。
+- **scheduler 池读取失败走重试链**：空池判定改 `_raw` 加载器，DB 读失败不再被吞成 skipped_empty_pool。
+- **Qoder 签到已领回放不短路**：reclaim 裁决 already 时仍盲发兜底再裁决，防漏领每日 100 积分；兜底全 miss 保留 already 口径防重试噪声。
+
+### 发布前审查修复（5 项）
+
+- **聚合侧迟到 error 守卫补齐**：非流式聚合收集器（collect_plain / aggregate_anthropic）done 收口后迟到的 error 不再丢弃已完整聚合的响应误判失败（与流式三出口同族口径，上游 main 同样未覆盖聚合路径）。
+- **三套错误帧出口统一**：wb/qoder/routes 同构的 `send_stream_error` 收敛到 `routes::send_stream_error_full` 单实现——Qoder/Trae/custom 池 Responses 错误帧同步补齐官方 SDK 必读字段、Anthropic 臂同步补收口；复审补充：Trae 池耗尽收尾（原内联三臂旧形态）一并纳入。
+- **Anthropic 合成收口改仅 message_stop**：收口不再带 message_delta——`stop_reason` 无「错误」官方枚举值，合成值会被严格 SDK 拒验；`event: error` 已进入错误分支，`message_stop` 仅负责终止流。
+- **Responses 门控收窄到真实载荷帧**：finish/usage-only 帧不再触发 created——消除「有 usage 无内容」流先发 created 再按空完成换号的重复 created 边界（不变式：created 已发 ⟺ 有内容 ⟺ 不走空完成换号）。
+- **kv_update 良性竞态判定结构化**：回滚清场失败以 `is_autocommit` 判定替代 «no transaction is active» 错误文案字符串匹配，不受 rusqlite 文案变化影响。
+
+### 验证
+
+- `cargo test`（workspace）、`tsc --noEmit`、`vitest` 全部通过。
+
 ## [1.6.1] · 2026-11-07 · 语义移植 main d04de4f => 245a611
 
 > 语义移植 4 实质提交（未 merge）；跳过桌面/OS 专属（豆包全链路、device_proxy/switcher）。
