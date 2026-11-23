@@ -6,6 +6,19 @@
 
 ---
 
+## [1.6.6] · 2026-11-21 · 语义移植 main b075a81 => 937ab9b（11 提交）
+
+> 跳过桌面/OS 专属项（workbuddy_atrest、device_proxy、doubao、TLS ring 收敛、前端 Tauri 接线等）。
+
+- **WB 网关**：账号×模型维度冷却（429 不再连坐整账号）；伪流式断流/空回代答可换号重试；账号级出口代理 + 签到间隔抖动；DSH 清洗与 11128 探针收口；DNS 瞬时错误自动重试。
+- **签到与成长**：WB 旅行三态判定修复；Trae JWT 每 6h 续期；OAuth 重登后自动补签；Qoder 无任务/体验版确定性归 skip；签到结果落库防并发丢失。
+- **通知与前端**：定时任务完成推送与「最近推送」回显；Qoder 签到看门狗与 done 口径升级；设置面板保存与脏标记修复。
+- **全面审查（六轮全量复审）**：401/凭证刷新瞬时失败按链路分流（签到、成长与网关），不再误判永久禁用；Anthropic 流空完成换号防重复响应；SSE 流内 error 不被空完成哨兵覆盖；expiresIn 非法值过滤收敛补齐；「解除/清除冷却」覆盖全池并复位熔断档位；Trae 损坏 JWT 归永久失败不再全天重试；通知推送防重与凭证脱敏；前端刷新序号守卫、签到日历跨月重算、丢帧看门狗、限频手动直通系列修复。其中刷新瞬时失败分流与 Anthropic/SSE 哨兵两处为上游同源共病，需回提 main。
+- **知悉项不修（上游同源）**：travel claim 失败仍出发返回 ok、proxy_url 仅签到链路生效、classify_wb_error 裸词过宽等。
+
+### 验证
+- `cargo test -p aiwork-core --lib`（1010 通过）/ `cargo test -p aiwork-server`（13 通过）/ `cargo check` 零警告 / `tsc` 零错误 / `vitest` 91 用例全过。
+
 ## [1.6.5+195p3] · 2026-11-20 · 语义移植 main a50d65f（#195 三期）
 
 > 语义移植桌面版 `a50d65f`（DSH 11128 预设描述块清洗与归因探针）；该提交此前仅合入 `upstream/main`，`docker_main` 分支缺失，本版补齐。跳过桌面专属路径差异。
@@ -21,6 +34,8 @@
 
 ### 验证
 - `cargo check -p aiwork-core` 通过；`cargo test -p aiwork-core wb_payload` / `wb_route` 回归通过。
+
+---
 
 ## [1.6.5] · 2026-11-11 · 语义移植 main 63c354f => b075a81（1 提交）
 
