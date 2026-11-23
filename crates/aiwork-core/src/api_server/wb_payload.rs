@@ -281,6 +281,36 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "DeepSeek Harness".to_string(),
             "AI coding assistant".to_string(),
         ),
+        // issue #195 三期（2026-11-11 v3.9.2 api 日志盲区实证，语义移植自 main
+        // a50d65f）：DSH 注入的预设描述块——「本机已安装 dsh-code-review 插件
+        // （代码审查模式 agent preset）：新建会话的预设选择器中可选「代码审查
+        // 模式」。该预设是只读代码审查 Agent……」原样透传即 11128 主嫌疑；短语级
+        // 规则在前、裸词兜底在后（"agent preset" / "预设选择器" 是上方短语规则
+        // 的子串，表序保证先整后零）；to 零特征词（回归门锁定）
+        (
+            "（代码审查模式 agent preset）".to_string(),
+            "（只读审查模式）".to_string(),
+        ),
+        (
+            "新建会话的预设选择器中可选「代码审查模式」".to_string(),
+            "新建会话时可在选择器中选择「只读审查」".to_string(),
+        ),
+        (
+            "该预设是只读代码审查 Agent".to_string(),
+            "该预设是只读审查助手".to_string(),
+        ),
+        (
+            "dsh-code-review".to_string(),
+            "code-review".to_string(),
+        ),
+        (
+            "agent preset".to_string(),
+            "assistant preset".to_string(),
+        ),
+        (
+            "预设选择器".to_string(),
+            "选择器".to_string(),
+        ),
     ]
 }
 
@@ -1145,12 +1175,12 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(300)
+        .take(2000)
         .collect();
     // 截断标记：原文超出 300 字符时尾部补省略号。UI「生成规则」取首句作 from
     // （模板改写是逐字 contains+replace 精确匹配），首句完整才可逐字命中；省略号
     // 让调用方明确区分「首句已完整」与「被截断的残句」，避免拿残句当规则落库
-    let truncated = system.chars().count() > 300;
+    let truncated = system.chars().count() > 2000;
     let mut out = format!(
         "system=\"{}{}\"",
         sys.replace('"', "'"),
@@ -1248,6 +1278,13 @@ const RESIDUAL_MARKERS: &[&str] = &[
     "interactive cli",
     "traecode",
     "zcode",
+    // issue #195 三期（2026-11-11 v3.9.2 api 日志实证，移植自 main a50d65f）：
+    // 清洗已净仍 11128，主嫌疑为 DSH 独家预设描述块原样透传，三个特征词均不在
+    // 模板表与本表。整词组口径防误报（"code-review" 裸词、单独 "preset"/"选择器"
+    // 不入表）
+    "dsh-code-review",
+    "agent preset",
+    "预设选择器",
 ];
 
 /// 残指纹自检 Value 核心（issue #158 P1-1：Qoder 池已在 active_peek 上持有
@@ -1348,7 +1385,30 @@ pub fn residual_fingerprint_note_with_rules(
             hits.push("acp_*".to_string());
         }
     }
-    // ③ 别名表 from 清洗后仍存活（别名未生效信号）——仅扫描生效规则（空 to
+    // ③ 工具描述特征词扫描（issue #195 三期 B4b，移植自 main a50d65f）：
+    // harness 独家文本可注入 description（样本与自检此前对描述通道均不可观测），
+    // 与工具名同口径小写比对；缺 function 回退顶层 description（Responses 原生）
+    if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+        for t in arr {
+            let desc = t
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .or_else(|| t.get("description").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_lowercase();
+            if desc.is_empty() {
+                continue;
+            }
+            hits.extend(
+                RESIDUAL_MARKERS
+                    .iter()
+                    .copied()
+                    .filter(|m| desc.contains(m))
+                    .map(str::to_string),
+            );
+        }
+    }
+    // ④ 别名表 from 清洗后仍存活（别名未生效信号）——仅扫描生效规则（空 to
     // = 用户主动停用，非「未生效」故障信号，不参与）
     for (from, to) in alias_rules {
         if to.is_empty() {
@@ -2521,6 +2581,41 @@ mod tests {
         assert!(
             !out2.to_lowercase().contains("deepseek harness"),
             "合并表下品牌词同样零残留: {out2}"
+        );
+    }
+
+    /// issue #195 三期（2026-11-11 移植自 main a50d65f）：DSH 预设描述块清洗——
+    /// 短语级规则逐句消除 + 裸词兜底，整段描述清洗后零特征词残留且幂等
+    #[test]
+    fn dsh_preset_block_cleaned_and_idempotent() {
+        let tpl = default_template_map();
+        // 真实 DSH system 中段预设描述块（超出旧 300 字符观测窗口）
+        let preset = "本机已安装 dsh-code-review 插件（代码审查模式 agent preset）：新建会话的预设选择器中可选「代码审查模式」。该预设是只读代码审查 Agent——审查正确性、缺陷、安全、性能、规范与测试覆盖，输出带严重程度分级（critical/high/medium/low/nit）与文件定位（路径+行号）的结构化审查报告；默认只读（read/grep/glob 与只读工具可用），不做写入或执行。";
+        let out = apply_template_map(preset, &tpl);
+        // 四个三期特征词（RESIDUAL_MARKERS 后三项 + 裸词）必须全净
+        for m in ["dsh-code-review", "agent preset", "预设选择器", "AI coding assistant"] {
+            assert!(
+                !out.to_lowercase().contains(m),
+                "预设描述块特征词残留 {m}: {out}"
+            );
+        }
+        // 语义保留：插件/预设概念仍在（非整段剥离）
+        assert!(out.contains("code-review"), "核心语义须保留: {out}");
+        assert!(out.contains("只读审查"), "改写方向: {out}");
+        // 幂等（改写结果不再命中任何规则）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+    }
+
+    /// issue #195 三期：残留自检特征词表覆盖预设描述块三词组（整词组口径，
+    /// `code-review` 裸词不入表防误报）
+    #[test]
+    fn residual_markers_cover_preset_block_words() {
+        for m in ["dsh-code-review", "agent preset", "预设选择器"] {
+            assert!(RESIDUAL_MARKERS.contains(&m), "特征词表缺 {m}");
+        }
+        assert!(
+            !RESIDUAL_MARKERS.contains(&"code-review"),
+            "裸词 code-review 不入表（防误报）"
         );
     }
 

@@ -6,6 +6,22 @@
 
 ---
 
+## [1.6.5+195p3] · 2026-11-20 · 语义移植 main a50d65f（#195 三期）
+
+> 语义移植桌面版 `a50d65f`（DSH 11128 预设描述块清洗与归因探针）；该提交此前仅合入 `upstream/main`，`docker_main` 分支缺失，本版补齐。跳过桌面专属路径差异。
+>
+> **版本号说明**：不用 1.6.6——上游后续发版会占用该号，本地移植提交用 `1.6.5+195p3` 后缀标识，合并上游时无冲突。
+
+### 修复与加固
+- **DSH 预设描述块清洗（issue #195 三期）**：默认清洗表补 6 条规则覆盖 DSH 注入的「本机已安装 dsh-code-review 插件（代码审查模式 agent preset）…」预设描述块——短语级逐句消除在前、`agent preset` / `预设选择器` 裸词兜底在后（表序保证先整后零），`to` 零特征词；该段文本是 DSH 独家、真实 Trae/Buddy 流量不会出现，清洗后仍原样透传是 11128 主嫌疑。
+- **指纹样本观测窗口 300 → 2000 字符**：DSH 预设描述块位于首条 system 中段，300 字符窗口内不可见（issue #195 owner 定位的观测盲区）；截断标记同步改为 2000。
+- **残留自检扩展到工具描述通道**：`residual_fingerprint_note_with_rules` 新增第 ③ 项扫描 `tools[].function.description`（缺 function 回退顶层 description），与工具名同口径小写比对特征词——描述通道此前样本与自检均不可观测。
+- **残留自检特征词补三项**：`dsh-code-review` / `agent preset` / `预设选择器`（整词组口径防误报，`code-review` 裸词与单独 `preset` 不入表）。
+- **11128 归因探针（B1）**：Fatal 终局以 detach 线程向**同一账号**发一次极简规范请求（无 tools、一句通用 system、`gen_conv_id()` 新会话），二分风控维度——探针仍被拦 = 账号/池维度标记嫌疑（内容路线无需再加规则）；探针通过 = 内容残留（继续模板路线）。结论只落 `[SCHED]` 日志，不改重试策略与 Fatal 语义；探针自身网络/非 11128 错误 → 归因未知不落结论（防误导）。
+
+### 验证
+- `cargo check -p aiwork-core` 通过；`cargo test -p aiwork-core wb_payload` / `wb_route` 回归通过。
+
 ## [1.6.5] · 2026-11-11 · 语义移植 main 63c354f => b075a81（1 提交）
 
 > 语义移植 3.9.3 单提交（未 merge）；跳过桌面/OS 专属项：CodeBuddy 槽位 meta 污染加固（switcher 模块桌面专属）、README 免费额度说明。

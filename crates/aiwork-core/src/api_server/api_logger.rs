@@ -299,9 +299,18 @@ impl ApiLogger {
             h, m, s, uid_short, status,
         ));
 
-        // 请求体（截取前 4KB 防止日志爆炸）
-        let req_preview = if req_body.len() > 4096 {
-            &req_body[..4096]
+        // 请求体（截取前 N KB 防止日志爆炸）
+        // issue #195 四期：wb/buddy 池此前无任何完整请求体记录，11128 只能看到
+        // system 前 2000 字符——DSH 独家文本位于首条 system 中段（4KB 之后），
+        // 与故障面完全重合。上限经 AIWORK_DEBUG_BODY_BYTES 可调，默认 64KB
+        // （clamp [4KB, 1MiB]），足以覆盖 DSH 真实 system 全文而不至于打爆日志
+        let cap = std::env::var("AIWORK_DEBUG_BODY_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(65536)
+            .clamp(4096, 1024 * 1024);
+        let req_preview = if req_body.len() > cap {
+            &req_body[..cap]
         } else {
             req_body
         };
