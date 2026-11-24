@@ -2495,8 +2495,12 @@ pub(crate) fn run_wb_stream(
                                         // wb_upstream 统一以「刷新请求失败:」前缀返回，对应签到侧
                                         // RefreshFail::Network）≠ 凭证级失效——同样换号不走
                                         // classify，防一次网络抖动把健康账号 SessionDead 踢出轮转；
-                                        // 仅凭证级失效（刷新端点 HTTP 错误）才落下方 classify
-                                        if e.starts_with("刷新请求失败") {
+                                        // 仅凭证级失效（刷新端点 HTTP 错误）才落下方 classify。
+                                        // 交叉审查补口（上游 1373b5c2 M1）：「刷新响应读取失败」
+                                        // （into_json 解码失败）同为传输层瞬时故障，一并放行
+                                        if e.starts_with("刷新请求失败")
+                                            || e.starts_with("刷新响应读取失败")
+                                        {
                                             break;
                                         }
                                     }
@@ -3207,8 +3211,12 @@ pub(crate) fn wb_aggregate_core(
                                             break;
                                         }
                                         // 审查修复（第五轮）：传输层瞬时失败同上分流——
-                                        // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify
-                                        if e.starts_with("刷新请求失败") {
+                                        // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify；
+                                        // 交叉审查补口（上游 1373b5c2 M1）：「刷新响应读取失败」
+                                        // （解码失败）同为瞬时故障，一并放行
+                                        if e.starts_with("刷新请求失败")
+                                            || e.starts_with("刷新响应读取失败")
+                                        {
                                             break;
                                         }
                                     }
@@ -3673,8 +3681,12 @@ pub async fn wb_tool_exec_chat(
                                                 ));
                                             }
                                             // 审查修复（第五轮）：传输层瞬时失败同上分流——
-                                            // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify
-                                            if e.starts_with("刷新请求失败") {
+                                            // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify；
+                                            // 交叉审查补口（上游 1373b5c2 M1）：「刷新响应读取失败」
+                                            // （解码失败）同为瞬时故障，一并放行
+                                            if e.starts_with("刷新请求失败")
+                                                || e.starts_with("刷新响应读取失败")
+                                            {
                                                 break Err(format!(
                                                     "wb-toolexec refresh uid={} 刷新暂时失败，本轮换号",
                                                     picked.uid

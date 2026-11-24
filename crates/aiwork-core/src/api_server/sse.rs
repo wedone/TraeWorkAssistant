@@ -331,6 +331,14 @@ fn stream_convert_src(
                     if saw_done {
                         continue;
                     }
+                    // 审查修复（上游 1373b5c2 三轮 Medium）：error→done 序列下真实业务
+                    // 错误优先——error 未流出时延迟上抛（不 break），随后 done 会无条件
+                    // 以 EMPTY 哨兵覆盖 error_info，真实错误丢失。已有错误且无内容直接
+                    // 收束；交叉审查回落：内容已流出时（error 后上游继续吐内容的罕见
+                    // 序列）不提前 break，回落正常收尾发 finish+[DONE]，防客户端收到截断流
+                    if error_info.is_some() && !has_content {
+                        break;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
@@ -533,6 +541,12 @@ fn stream_convert_text_src(
                     // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
                     if saw_done {
                         continue;
+                    }
+                    // 审查修复（上游 1373b5c2 三轮 Medium）：error→done 序列下真实业务
+                    // 错误优先，口径同 stream_convert_lines（已有错误且无内容才收束；
+                    // 内容已流出时回落正常收尾防截断流）
+                    if error_info.is_some() && !has_content {
+                        break;
                     }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
@@ -1357,6 +1371,14 @@ fn stream_convert_anthropic_src(
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }
+                    // 审查修复（上游 1373b5c2 三轮 Medium）：error→done 序列下真实业务
+                    // 错误优先——error 未流出（message_started=false 且 tools 空）且随后
+                    // done 无内容时，done 会以 EMPTY 哨兵覆盖 error_info，此处提前收束
+                    // 保留真实错误；交叉审查回落：内容已流出时（error 后上游继续吐内容
+                    // 的罕见序列）不提前 break，回落正常收尾发 message_delta/message_stop
+                    if error_info.is_some() && !(message_started || !tools.is_empty()) {
+                        break;
+                    }
                     if !(message_started || !tools.is_empty()) {
                         // 空完成（影子风控/上游异常）：不发 message_delta/message_stop，
                         // 以哨兵错误上抛调用方换号重试（issue #57）。审查修复
@@ -2066,6 +2088,93 @@ mod tests {
             "[DONE] 后不得再拼 error 帧"
         );
         assert_eq!(joined.matches("data: [DONE]").count(), 1, "不得重复 [DONE]");
+    }
+
+    /// 上游 1373b5c2（三轮 Medium）回归：error → done 序列、error 未流出且 done
+    /// 无内容时，真实业务错误优先——不得被空完成哨兵覆盖（否则误走全池换号重试）
+    #[test]
+    fn error_then_done_keeps_real_error_openai() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: error\ndata: {\"code\":4001,\"message\":\"model config is empty\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        let (code, msg) = error_info.expect("应保留真实错误上抛");
+        assert_eq!(code, 4001, "真实业务错误码不得被 EMPTY 哨兵覆盖");
+        assert_eq!(msg, "model config is empty");
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+        assert!(!sent_any);
+        assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    /// 同口径回归（text 出口）
+    #[test]
+    fn error_then_done_keeps_real_error_text() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: error\ndata: {\"code\":4001,\"message\":\"model config is empty\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_text_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "m",
+        );
+        let (code, msg) = error_info.expect("应保留真实错误上抛");
+        assert_eq!(code, 4001);
+        assert_eq!(msg, "model config is empty");
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+        assert!(!sent_any);
+        assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    /// 同口径回归（Anthropic 出口）：message_start 未发且无工具块时真实错误优先
+    #[test]
+    fn error_then_done_keeps_real_error_anthropic() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: error\ndata: {\"code\":4001,\"message\":\"model config is empty\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        let (code, msg) = error_info.expect("应保留真实错误上抛");
+        assert_eq!(code, 4001);
+        assert_eq!(msg, "model config is empty");
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+        assert!(!sent_any);
+        assert!(!collect_events(rx).join("\n").contains("message_stop"));
+    }
+
+    /// 交叉审查回落：error 后上游仍吐内容（罕见序列）时不得提前收束，
+    /// 正常收尾发 finish + [DONE]，防客户端收到截断流
+    #[test]
+    fn error_then_content_then_done_still_closes_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: error\ndata: {\"code\":500,\"message\":\"late boom\"}\n\n\
+                     event: output\ndata: {\"response\":\"尾段\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        assert_eq!(error_info, Some((500, "late boom".to_string())));
+        assert!(sent_any, "内容已流出");
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("尾段"), "内容应已发出");
+        assert!(
+            joined.contains("\"finish_reason\":\"stop\""),
+            "内容已流出时应回落正常收尾"
+        );
+        assert!(joined.contains("data: [DONE]"), "不得让客户端收到截断流");
     }
 
     /// 聚合侧同族回归（docker 审查 #2 补齐）：done 收口后迟到的 error 不得丢弃

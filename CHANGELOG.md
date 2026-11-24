@@ -6,6 +6,21 @@
 
 ---
 
+## [1.6.7] · 2026-11-24 · 语义移植 main 937ab9b => 1373b5c2（1 提交，补齐漏项）
+
+> 上游 `1373b5c2`（WB 域五/六轮审查修复）此前只在 1.6.6 的变更说明里被概括，代码层有三处
+> 未实际落地（SSE 转换器 error→done 守卫、网关刷新解码失败放行、growth 死号跳过）。本版补齐。
+> 跳过桌面/OS 专属项（豆包签到 2774d482、豆包设计文档 a89f3ad0 属桌面产品线）。
+
+- **SSE 转换器 error→done 守卫（三出口）**：`stream_convert_lines` / `stream_convert_text_lines` / `stream_convert_anthropic_src` 的 `done` 分支新增「已有 error_info 且无内容则直接收束」——此前 error 帧后紧跟 done 且无正文时，done 会以 EMPTY 哨兵覆盖真实业务错误，调用方误走「空完成换号重试」全池轮换并丢失上游真实报错。内容已流出的罕见序列（error 后上游继续吐内容）不提前 break，回落正常收尾发 finish/[DONE]，防客户端收到截断流。
+- **网关刷新解码失败归瞬时（三路径）**：`wb_route` 流式 / 聚合 / toolexec 三处的刷新失败分流此前只放行「刷新请求失败:」，漏了「刷新响应读取失败:」（`into_json` 解码失败）——该错误会落 `classify_wb_http_error(401)` 被判 SessionDead，健康账号被永久禁用且无手动启用入口。现两条前缀一并换号不 classify。
+- **growth 轮跳过死号**：`run_growth_round` 对齐签到轮 `skip_expired` 门控，`needs_relogin` 账号不再在每个调度轮重复刷 401/刷新链；事件带 `permanent: true` + 「需重新登录，已跳过」，供调度器 `is_permanent_failure` 计数归档而不消耗重试预算。
+- **Trae 损坏 JWT 前置收口**：`run_round` 在 status 预检前判 `user_id.is_none()` → 直接落 BadJwt 永久失败（调度器已认该类型），不再白跑一次必败的网络请求，也不再全天 8 轮无效重试 + 每轮失败推送。
+- **with_retry 永久失败文案补「需重新登录」**：调度器对无 `permanent` 字段的旧事件退化按子串匹配，缺该词会让凭证已死账号在成长轮全天 30→120 分钟退避重试。
+
+### 验证
+- `cargo test -p aiwork-core --lib`（1017 通过，新增 4 个 error→done 回归）/ `cargo test -p aiwork-server`（13 通过）/ `cargo check --workspace` 零警告。
+
 ## [1.6.6] · 2026-11-21 · 语义移植 main b075a81 => 937ab9b（11 提交）
 
 > 跳过桌面/OS 专属项（workbuddy_atrest、device_proxy、doubao、TLS ring 收敛、前端 Tauri 接线等）。

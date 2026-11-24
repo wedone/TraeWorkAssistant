@@ -672,6 +672,30 @@ pub fn run_round(
 
         let info = jwt::parse(&jwt);
         let uid_str = info.user_id.clone().unwrap_or_default();
+        // 审查修复（上游 1373b5c2 六轮 M1）：JWT 存在但损坏（无法解析出 user id）
+        // 归 BadJwt 永久类型——原实现 uid=None 时 status_check 直接失败走
+        // classify_error(0,None)→Unknown 可重试，调度器全天约 8 轮无效重试且每轮
+        // 触发失败推送；在 status_check 前收口，对齐「未配置 jwt」口径
+        // （cooldown=-1 永久 + 调度器 failed_permanent 排除），也省掉一次必败的网络请求
+        if info.user_id.is_none() {
+            failed += 1;
+            // 交叉审查修复：摘要键用账号配置的 user_id（与「未配置 jwt」路径同口径）
+            // ——JWT 损坏时派生 uid 为空串，多损坏账号会碰撞空键
+            let uid = acc.user_id.clone().unwrap_or_default();
+            let msg = "jwt 无法解析（损坏或不完整），请重新抓取";
+            results.push(json!({
+                "name": name, "user_id": uid, "ok": false, "code": 0,
+                "message": msg, "action": "claim",
+            }));
+            emit(&json!({
+                "type": "account", "index": idx, "user_id": uid, "name": name,
+                "status": "fail", "message": msg,
+                "error_type": "BadJwt", "cooldown_until": 9_999_999_999i64,
+            }));
+            round_names.insert(uid.clone(), name.clone());
+            outcome.statuses.insert(uid, "fail");
+            continue;
+        }
 
         // JWT 过期告警（摘要 warnings；影响续期提醒，不阻塞签到）
         if let (Some(h), Some(exp)) = (info.exp_hours, info.exp_timestamp) {

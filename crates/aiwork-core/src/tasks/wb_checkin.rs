@@ -998,12 +998,15 @@ where
                 reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
             }
             wb_common::mark_needs_relogin(state, acct_id, &reason);
+            // 文案补「需重新登录」（上游 1373b5c2 对齐）：调度器 is_permanent_failure
+            // 对无 permanent 字段的旧事件退化按「需重新登录」子串匹配，缺该词会让
+            // 死号被当可重试失败全天退避重试
             let msg_fail = match fail_detail.as_deref() {
                 Some(d) => format!(
-                    "登录态失效且刷新失败；上游: {d}（{}）",
+                    "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
                     wb_common::refresh_fail_hint(d)
                 ),
-                None => "登录态失效且刷新失败".into(),
+                None => "登录态失效且刷新失败，需重新登录".into(),
             };
             return ("fail".into(), msg_fail, true);
         }
@@ -1498,6 +1501,23 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
         let proxy_url = acct.get("proxy_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         let acct_agent = proxy_url.map(|p| http_agent_with_proxy(30, Some(p)));
         let agent = acct_agent.as_ref().unwrap_or(&agent);
+        // 交叉审查修复（上游 1373b5c2 No.5）：跳过已标死号（needs_relogin）——
+        // 对齐签到轮 process_account 的 skip_expired 门控，防死号在后续每个 growth
+        // 调度轮被重复选中刷 401/刷新链；事件保持 fail + permanent 口径供调度器
+        // is_permanent_failure 计数归档（不重复消耗当日重试预算）
+        if py_truthy(acct.get("needs_relogin")) {
+            let aid = s_of(acct.get("id"));
+            let name = first_str(&[
+                acct.get("nickname").and_then(Value::as_str).map(str::to_string),
+                Some(s_of(acct.get("uid")).chars().take(8).collect()),
+                Some(aid.clone()),
+            ]);
+            emit(&json!({
+                "type": "growth", "index": i + 1, "user_id": aid, "name": name,
+                "status": "fail", "permanent": true, "message": "需重新登录，已跳过",
+            }));
+            continue;
+        }
         let mut ev = process_account_growth(state, agent, acct, flags);
         ev["index"] = json!(i + 1);
         emit(&ev);
