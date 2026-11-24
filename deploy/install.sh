@@ -353,7 +353,11 @@ PKG_ROOT="$TMP_DIR/unpack/aiwork-server-linux-amd64"
 [[ -x "$PKG_ROOT/aiwork-server" ]] || die "安装包内缺少 aiwork-server 可执行文件"
 [[ -d "$PKG_ROOT/dist" ]]          || die "安装包内缺少前端产物 dist/"
 PKG_VERSION="$(cat "$PKG_ROOT/VERSION" 2>/dev/null || echo '未知')"
-ok "安装包解包完成（版本 $PKG_VERSION）"
+PKG_COMMIT="$(tr -d '\r\n' < "$PKG_ROOT/COMMIT" 2>/dev/null || true)"
+# 摘要里带上来源 commit：同版本多次构建（如 docker_main 滚动包）可区分
+PKG_COMMIT_HINT=""
+if [[ -n "$PKG_COMMIT" ]]; then PKG_COMMIT_HINT="（commit ${PKG_COMMIT:0:7}）"; fi
+ok "安装包解包完成（版本 $PKG_VERSION${PKG_COMMIT_HINT}）"
 
 # ── 3. 密钥判定（必须在停服/换二进制之前，中止时服务仍在运行）──────────────────
 step 3/8 "密钥判定"
@@ -429,11 +433,21 @@ fi
 if [[ -f "$INSTALL_DIR/VERSION" ]]; then
   cp -f "$INSTALL_DIR/VERSION" "$INSTALL_DIR/VERSION.prev"
 fi
+if [[ -f "$INSTALL_DIR/COMMIT" ]]; then
+  cp -f "$INSTALL_DIR/COMMIT" "$INSTALL_DIR/COMMIT.prev"
+fi
 
 install -m 0755 "$PKG_ROOT/aiwork-server" "$INSTALL_DIR/aiwork-server"
 rm -rf "$INSTALL_DIR/dist"
 cp -a "$PKG_ROOT/dist" "$INSTALL_DIR/dist"
 printf '%s\n' "$PKG_VERSION" > "$INSTALL_DIR/VERSION"
+# 来源提交（CI 包里带 COMMIT）：落盘便于线上排查「这机器跑的是哪个 commit」——
+# 此前只有 VERSION，同版本多次构建无法区分
+if [[ -f "$PKG_ROOT/COMMIT" ]]; then
+  cp -f "$PKG_ROOT/COMMIT" "$INSTALL_DIR/COMMIT"
+else
+  rm -f "$INSTALL_DIR/COMMIT"
+fi
 chown -R root:root "$INSTALL_DIR"
 chmod -R a+rX "$INSTALL_DIR"
 ok "程序已安装到 $INSTALL_DIR（二进制 + dist）"
@@ -603,6 +617,9 @@ else
     if [[ -f "$INSTALL_DIR/VERSION.prev" ]]; then
       cp -f "$INSTALL_DIR/VERSION.prev" "$INSTALL_DIR/VERSION"
     fi
+    if [[ -f "$INSTALL_DIR/COMMIT.prev" ]]; then
+      cp -f "$INSTALL_DIR/COMMIT.prev" "$INSTALL_DIR/COMMIT"
+    fi
     systemctl restart "$SERVICE"
     if verify_service; then
       die "新版本未通过探活，已完整回滚到旧版本并恢复运行。请检查新版本兼容性后重试"
@@ -626,7 +643,7 @@ cat <<EOF
 
 ${c_ok}════════════════════ 部署完成 ════════════════════${c_off}
 
-  版本        : ${PKG_VERSION}
+  版本        : ${PKG_VERSION}${PKG_COMMIT_HINT}
   访问地址    : http://${IP_HINT}:${PORT}
   管理令牌    : ${SHOW_TOKEN}
   数据目录    : ${DATA_DIR}
