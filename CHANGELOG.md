@@ -6,6 +6,21 @@
 
 ---
 
+## [未发布] · 2026-11-26 · Qoder 体验版签到资格判定修复（issue #223 补漏）
+
+### 修复
+- **Qoder 体验版签到判定恒假（issue #223 补漏）**：`process_account` 的 `plan_free` 原按英文 `"free"` 比对，而 `plan` 列实际存的是 `plan_display_name` 归一后的**中文展示名**（本机实测字节 `e4bd93e9aa8ce78988` = 体验版），`"体验版".eq_ignore_ascii_case("free")` 恒假 → 上游 v3.9.5 的「体验版确定性跳过」分支从未生效。结果是：官方自 2026-11-19 起对体验版停投每日 100 Credits 后，本应安静跳过并灰标提示的场景，实际掉进「活动表为空」失败兜底，按 30/60/120 分钟全天退避重试并计入失败。
+  - 新增 `qoder_common::plan_is_free_tier(stored_plan)`：同时接受归一后的「体验版」与原始上游形态（`PLAN_TIER_FREE` / `free` / `Free`），并**显式排除试用期档位**。
+- **试用期与体验版档位混同（同一修复的预防项）**：`plan_display_name` 原把 `trial` 与 `free` 一并映射为「体验版」。官方公告（docs.qoder.cn/events/100credits）中**试用期仍可领取**每日 100 Credits，混同会让试用期账号被误判为不可领而整月白跳过。现 `trial` 归「**试用版**」、`free` 归「**体验版**」，展示与判定双向可辨。
+
+### 验证
+- `cargo test -p aiwork-core --lib tasks::qoder_common`（20 项，含新增 `plan_is_free_tier_识别展示名与原始形态` 回归门）全部通过。
+- `cargo test -p aiwork-core --lib tasks::qoder_checkin`（20 项）全部通过。
+- `cargo check -p aiwork-core` 零警告。
+
+### 未部署说明
+按维护约定，本次仅提交代码；CI 与部署在下次合并上游更新时一并执行。当前运行实例仍为 1.6.7。
+
 ## [1.6.7] · 2026-11-24 · 语义移植 main 937ab9b => 1373b5c2（1 提交，补齐漏项）
 
 > 上游 `1373b5c2`（WB 域五/六轮审查修复）此前只在 1.6.6 的变更说明里被概括，代码层有三处

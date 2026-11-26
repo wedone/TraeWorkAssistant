@@ -759,6 +759,12 @@ pub fn fetch_userinfo(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String
 ///   （高级版）、`PLAN_TIER_ULTRA`（旗舰版）；定价档位见 `/api/v1/products/pricing/all`
 ///   （Pro / Pro+ / Ultra）。
 /// 匹配不分大小写、下划线归一为空格；未识别档位原样透传。
+///
+/// issue #223 补充（2026-11-26）：`trial`（试用期）与 `free`（体验版）**必须区分**。
+/// 原实现把两者都映射为「体验版」，导致签到侧无法辨别官方政策差异——每日 100
+/// Credits 自 2026-11-19 起对**体验版**停投，但**试用期仍可领取**（官方公告
+/// docs.qoder.cn/events/100credits）。若不区分，试用期账号会被误判为不可领而
+/// 白白跳过本该成功的签到。故 trial 归「试用版」，free 归「体验版」。
 pub fn plan_display_name(raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
@@ -766,7 +772,12 @@ pub fn plan_display_name(raw: &str) -> String {
     }
     let l = s.to_ascii_lowercase().replace('_', " ");
     // 顺序敏感：trial/free 必须先于 pro（"Pro Trial" 属试用档）；pro plus 先于 pro（子串包含）
-    if l.contains("trial") || l.contains("free") {
+    // trial 先于 free：'trial' 是试用期（可领每日 100 Credits），与体验版政策不同，
+    // 不得合并展示；仅裸 free / PLAN_TIER_FREE 才归体验版
+    if l.contains("trial") {
+        return "试用版".into();
+    }
+    if l.contains("free") {
         return "体验版".into();
     }
     if l.contains("ultra") || l.contains("ultimate") {
@@ -781,7 +792,34 @@ pub fn plan_display_name(raw: &str) -> String {
     s.to_string()
 }
 
-/// 套餐档位回填门控（qoder_credits 余额刷新顺带拉取 /api/v2/user/plan 的决策函数，
+/// 签到资格判定（issue #223）：账号套餐是否属于「每日 100 Credits 不投放」的
+/// 体验版（免费）档。
+///
+/// 为什么需要独立函数而非直接比对存储值：`plan` 列存的是
+/// [`plan_display_name`] 归一后的**展示名**（中文），而调用方曾按英文 `"free"`
+/// 比对——`"体验版".eq_ignore_ascii_case("free")` 恒假，导致上游 v3.9.5 的
+/// 「体验版确定性跳过」分支从未生效（本机实测：plan 字节 `e4bd93e9aa8ce78988`
+/// 即「体验版」，签到仍走失败兜底并触发全天重试）。本函数同时接受：
+/// - 已归一的展示名「体验版」
+/// - 原始上游形态：`PLAN_TIER_FREE` / `free` / `Free` 等（含 free 子串且不含
+///   trial——`Pro Trial` 属试用期，官方仍可领，不得误判）
+pub fn plan_is_free_tier(stored_plan: &str) -> bool {
+    let s = stored_plan.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s == "体验版" {
+        return true;
+    }
+    let l = s.to_ascii_lowercase().replace('_', " ");
+    // 试用期（含 free 字样但性质是 trial）优先排除：官方对其照常投放活动
+    if l.contains("trial") {
+        return false;
+    }
+    l.contains("free")
+}
+
+/// 套餐档位回填门控（qoder_credits 余额刷新顺带拉取 /api/v2/user/plan 的决策函数，/// 套餐档位回填门控（qoder_credits 余额刷新顺带拉取 /api/v2/user/plan 的决策函数，
 /// 2026-10-02 审查优化）：仅当 ①本行余额拉取成功 且 ②池内无套餐 或 存量值为待归一
 /// 的原始档位名（plan_display_name 对已归一展示名/Teams 等未知档位映射为自身）时
 /// 才发起查询——已归一账号的余额刷新不再支付每次一次的额外 HTTP 往返。
@@ -1550,7 +1588,9 @@ mod tests {
     #[test]
     fn plan_display_name_maps_known_tiers() {
         assert_eq!(plan_display_name("PLAN_TIER_FREE"), "体验版");
-        assert_eq!(plan_display_name("Pro Trial"), "体验版");
+        // issue #223 修复：试用期与体验版政策不同（官方对试用期照常投放每日
+        // 100 Credits），展示名必须区分，不得合并为「体验版」
+        assert_eq!(plan_display_name("Pro Trial"), "试用版");
         assert_eq!(plan_display_name("PLAN_TIER_PRO"), "专业版");
         assert_eq!(plan_display_name("Pro"), "专业版");
         assert_eq!(plan_display_name("PLAN_TIER_PRO_PLUS"), "高级版");
@@ -1563,7 +1603,35 @@ mod tests {
         assert_eq!(plan_display_name("Enterprise"), "Enterprise");
     }
 
-    /// 套餐回填门控（集成口径）：行失败恒不查；池内空/待归一原始名才查；
+    /// 签到资格判定（issue #223 回归门）：plan 列存的是归一后的中文展示名，
+    /// 此前调用方按英文 "free" 比对恒假 → 「体验版确定性跳过」永不生效（本机
+    /// 实测字节 e4bd93e9aa8ce78988 = 体验版，签到掉进失败兜底并全天重试）。
+    /// 本表锁定：中文展示名与原始上游形态都必须判真；试用期/付费档一律判假
+    #[test]
+    fn plan_is_free_tier_识别展示名与原始形态() {
+        // 本机实证：存储值就是中文「体验版」
+        assert!(plan_is_free_tier("体验版"));
+        // 原始上游形态（Web 枚举 / openapi 展示名 / 裸词大小写）
+        assert!(plan_is_free_tier("PLAN_TIER_FREE"));
+        assert!(plan_is_free_tier("free"));
+        assert!(plan_is_free_tier("Free"));
+        // 关键反例：Pro Trial 虽含 free 语义影子，但属试用期——官方照常投放
+        // 每日 100 Credits，误判会让试用期用户整月白跳过
+        assert!(!plan_is_free_tier("Pro Trial"));
+        assert!(!plan_is_free_tier("PLAN_TIER_TRIAL"));
+        assert!(!plan_is_free_tier("试用版"));
+        // 付费档与未知档不误判
+        assert!(!plan_is_free_tier("专业版"));
+        assert!(!plan_is_free_tier("PLAN_TIER_PRO"));
+        assert!(!plan_is_free_tier("高级版"));
+        assert!(!plan_is_free_tier("旗舰版"));
+        assert!(!plan_is_free_tier("Teams"));
+        // 空 plan 不误判（导入时 userinfo 失败可为空，账号页刷新可回填）
+        assert!(!plan_is_free_tier(""));
+        assert!(!plan_is_free_tier("   "));
+    }
+
+    /// 套餐回填门控（集成口径）：行失败恒不查；池内空/待归一原始名才查；    /// 套餐回填门控（集成口径）：行失败恒不查；池内空/待归一原始名才查；
     /// 已归一展示名与未知档位（映射为自身）不查——保证归一只发生一次
     #[test]
     fn need_plan_fetch_门控矩阵() {
@@ -1571,6 +1639,7 @@ mod tests {
         assert!(need_plan_fetch(true, "Pro Trial"), "openapi 原始展示名待归一");
         assert!(need_plan_fetch(true, "PLAN_TIER_PRO"), "Web 枚举形态待归一");
         assert!(!need_plan_fetch(true, "体验版"), "已归一展示名不再查");
+        assert!(!need_plan_fetch(true, "试用版"), "试用版已归一，不再回查");
         assert!(!need_plan_fetch(true, "Teams"), "未知档位映射为自身，不重复查");
         assert!(!need_plan_fetch(false, ""), "行失败（401 自愈未果等）不查");
         assert!(!need_plan_fetch(false, "Pro Trial"));

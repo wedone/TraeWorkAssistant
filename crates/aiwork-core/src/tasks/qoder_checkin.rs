@@ -1386,7 +1386,13 @@ fn process_account(
     // 未满足活动资格判定（issue #223 移植）：plan 由 userinfo 回填（free | pro | pro+ |
     // teams），导入时 userinfo 失败可为空——仅显式 free 才归类 skip，空 plan 不
     // 误判（账号页刷新账号信息可回填）
-    let plan_free = s_of(acct.get("plan")).eq_ignore_ascii_case("free");
+    //
+    // issue #223 修复（2026-11-26）：`plan` 列实际存的是 plan_display_name 归一后的
+    // **中文展示名**（本机实测字节 e4bd93e9aa8ce78988 = 「体验版」），此处原先按英文
+    // `"free"` 比对恒假 → 「体验版确定性跳过」分支从未生效，签到掉进失败兜底并触发
+    // 全天 30/60/120 分钟退避重试。改走 plan_is_free_tier（兼容展示名与原始形态，
+    // 且排除 Pro Trial 等试用期档位——官方对试用期照常投放活动）
+    let plan_free = qoder_common::plan_is_free_tier(&s_of(acct.get("plan")));
     let (creds, refreshed, note) = qoder_common::ensure_fresh(state, agent, &aid, opts.lazy_hours);
     if creds.access_token.is_empty() {
         let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
